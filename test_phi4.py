@@ -5,7 +5,6 @@ This script tests if Phi-4 model is properly installed and running.
 """
 
 import time
-import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def test_phi4_model(prompt="Explain quantum computing in simple terms"):
@@ -19,8 +18,7 @@ def test_phi4_model(prompt="Explain quantum computing in simple terms"):
         model_name = "/home/TomAdmin/phi-4"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, 
-            torch_dtype=torch.float16, 
+            model_name,
             device_map="auto",
             trust_remote_code=True
         )
@@ -29,18 +27,10 @@ def test_phi4_model(prompt="Explain quantum computing in simple terms"):
         print(f"❌ Error loading model: {e}")
         return False
     
-    # Check if CUDA is available
-    device_info = "CUDA" if torch.cuda.is_available() else "CPU"
-    if torch.cuda.is_available():
-        device_name = torch.cuda.get_device_name(0)
-        print(f"✅ Using GPU: {device_name}")
-    else:
-        print("ℹ️ Using CPU (no CUDA available)")
-    
     # Test generation
     print("\nGenerating text with prompt:", prompt)
     try:
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        inputs = tokenizer(prompt, return_tensors="pt")
         outputs = model.generate(
             inputs.input_ids,
             max_new_tokens=512,
@@ -60,7 +50,7 @@ def test_phi4_model(prompt="Explain quantum computing in simple terms"):
         elapsed_time = end_time - start_time
         print(f"✅ Generation successful!")
         print(f"⏱️ Total time elapsed: {elapsed_time:.2f} seconds")
-        print(f"📊 Using device: {device_info}")
+        print(f"📊 Using CPU")
         return True
     except Exception as e:
         print(f"❌ Error generating text: {e}")
