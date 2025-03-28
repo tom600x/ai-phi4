@@ -2,7 +2,7 @@ import torch
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def load_phi4_model(model_path="/home/TomAdmin/phi4"):
+def load_phi4_model(model_path="/home/TomAdmin/phi-4"):
     """Load the Phi-4 model and tokenizer from the specified path."""
     print(f"Loading Phi-4 model from {model_path}")
     
