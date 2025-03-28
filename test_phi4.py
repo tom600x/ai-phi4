@@ -16,7 +16,7 @@ def test_phi4_model(prompt="Explain quantum computing in simple terms"):
     # Load the model and tokenizer
     print("Loading Phi-4 model and tokenizer...")
     try:
-        model_name = "microsoft/Phi-4"
+        model_name = "/home/TomAdmin/phi-4"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(
             model_name, 
