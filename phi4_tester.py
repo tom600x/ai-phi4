@@ -8,50 +8,83 @@ def load_phi4_model(model_path="/home/TomAdmin/phi-4"):
     
     # Check if the model path exists
     if not os.path.exists(model_path):
-        raise ValueError(f"Model path {model_path} does not exist!")
+        print(f"WARNING: Model path {model_path} does not exist!")
+        model_path = input("Please enter the correct path to the phi4 model: ")
+        if not os.path.exists(model_path):
+            raise ValueError(f"Model path {model_path} still does not exist!")
     
-    # Load tokenizer and model directly from the local path
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        local_files_only=True
-    )
+    print(f"Using model path: {model_path}")
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
-        local_files_only=True
-    )
-    
-    return model, tokenizer
+    try:
+        # Load tokenizer and model directly from the local path
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            local_files_only=True
+        )
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+            local_files_only=True
+        )
+        
+        print("Model and tokenizer loaded successfully!")
+        return model, tokenizer
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        raise
 
 def generate_response(model, tokenizer, prompt, max_length=500, temperature=0.7):
     """Generate a response using the Phi-4 model."""
-    # Format the input
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    
-    # Generate response
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_length,  # Use max_new_tokens instead of max_length
-            temperature=temperature,
-            do_sample=True,
-            top_p=0.95,
-            top_k=50,
-            repetition_penalty=1.1
-        )
-    
-    # Decode the response, avoiding the input prompt repetition
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Attempt to remove the original prompt from the response if it appears at the beginning
-    if response.startswith(prompt):
-        response = response[len(prompt):].strip()
+    try:
+        print(f"Processing prompt: '{prompt}'")
         
-    return response
+        # Format the input
+        inputs = tokenizer(prompt, return_tensors="pt")
+        
+        # Move inputs to the same device as the model
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        print(f"Generating response on device: {device}")
+        
+        # Generate response
+        with torch.no_grad():
+            # Print token IDs for debugging
+            print(f"Input token IDs: {inputs['input_ids'][0][:10]}...")
+            
+            generation_config = {
+                "max_new_tokens": max_length,
+                "temperature": temperature,
+                "do_sample": True,
+                "top_p": 0.95,
+                "top_k": 50,
+                "repetition_penalty": 1.1,
+                "pad_token_id": tokenizer.eos_token_id  # Add this line
+            }
+            
+            outputs = model.generate(**inputs, **generation_config)
+            
+            print(f"Generated {outputs.shape[1]} tokens")
+        
+        # Decode the response
+        full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # If the response contains the original prompt, remove it
+        if prompt in full_response:
+            response = full_response.split(prompt, 1)[1].strip()
+        else:
+            response = full_response
+            
+        print(f"Response generated successfully! Length: {len(response)} chars")
+        return response
+    
+    except Exception as e:
+        print(f"Error during generation: {str(e)}")
+        return f"Error generating response: {str(e)}"
 
 def main():
     try:
@@ -60,7 +93,10 @@ def main():
         
         # Test with a single prompt first to verify functionality
         print("\nTesting model with a simple prompt...")
-        test_response = generate_response(model, tokenizer, "Hello, what can you do?", max_length=100)
+        test_prompt = "Hello, my name is Tom. What can you tell me about yourself?"
+        print(f"Test prompt: '{test_prompt}'")
+        
+        test_response = generate_response(model, tokenizer, test_prompt, max_length=100)
         print(f"Response: {test_response}\n")
         
         # Interactive mode
@@ -75,11 +111,13 @@ def main():
             print(f"\nResponse:\n{response}")
     
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Critical error: {str(e)}")
         print("\nTroubleshooting tips:")
         print("1. Make sure the model path is correct")
         print("2. Ensure you have sufficient GPU memory if using CUDA")
         print("3. Check that all required libraries are installed")
+        print("4. Try installing the latest version of transformers: pip install -U transformers")
+        print("5. If using CPU only, add 'device_map=\"cpu\"' to the model loading code")
 
 if __name__ == "__main__":
     main()
