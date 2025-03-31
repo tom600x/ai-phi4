@@ -42,20 +42,14 @@ def generate_response(model, tokenizer, prompt, max_length=500, temperature=0.7)
     try:
         print(f"Processing prompt: '{prompt}'")
         
-        # Format the input
-        inputs = tokenizer(prompt, return_tensors="pt")
-        
-        # Move inputs to the same device as the model
-        device = next(model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        print(f"Generating response on device: {device}")
+        # Format the input with proper formatting for phi-4
+        # First get the input token IDs
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+        input_length = input_ids.shape[1]
+        print(f"Input length: {input_length} tokens")
         
         # Generate response
         with torch.no_grad():
-            # Print token IDs for debugging
-            print(f"Input token IDs: {inputs['input_ids'][0][:10]}...")
-            
             generation_config = {
                 "max_new_tokens": max_length,
                 "temperature": temperature,
@@ -63,27 +57,35 @@ def generate_response(model, tokenizer, prompt, max_length=500, temperature=0.7)
                 "top_p": 0.95,
                 "top_k": 50,
                 "repetition_penalty": 1.1,
-                "pad_token_id": tokenizer.eos_token_id  # Add this line
+                "pad_token_id": tokenizer.eos_token_id
             }
             
-            outputs = model.generate(**inputs, **generation_config)
+            outputs = model.generate(
+                input_ids,
+                **generation_config
+            )
             
-            print(f"Generated {outputs.shape[1]} tokens")
+            print(f"Total generated tokens: {outputs.shape[1]}")
+            print(f"New tokens: {outputs.shape[1] - input_length}")
         
-        # Decode the response
-        full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Extract only the newly generated tokens (skip the input)
+        new_tokens = outputs[0, input_length:]
         
-        # If the response contains the original prompt, remove it
-        if prompt in full_response:
-            response = full_response.split(prompt, 1)[1].strip()
-        else:
-            response = full_response
+        # Decode only the new tokens
+        response = tokenizer.decode(new_tokens, skip_special_tokens=True)
             
         print(f"Response generated successfully! Length: {len(response)} chars")
+        
+        # Print the first 50 characters for debugging
+        preview = response[:50] + "..." if len(response) > 50 else response
+        print(f"Response preview: {preview}")
+        
         return response
     
     except Exception as e:
         print(f"Error during generation: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return f"Error generating response: {str(e)}"
 
 def main():
@@ -93,10 +95,10 @@ def main():
         
         # Test with a single prompt first to verify functionality
         print("\nTesting model with a simple prompt...")
-        test_prompt = "Hello, my name is Tom. What can you tell me about yourself?"
+        test_prompt = "You are Phi-4, an AI assistant. Answer this question: What are three interesting facts about space?"
         print(f"Test prompt: '{test_prompt}'")
         
-        test_response = generate_response(model, tokenizer, test_prompt, max_length=100)
+        test_response = generate_response(model, tokenizer, test_prompt, max_length=150)
         print(f"Response: {test_response}\n")
         
         # Interactive mode
@@ -107,11 +109,17 @@ def main():
                 break
             
             print("Generating response...")
-            response = generate_response(model, tokenizer, user_input)
+            
+            # Add a system prompt to help the model
+            full_prompt = f"You are Phi-4, an AI assistant. Answer this question: {user_input}"
+            
+            response = generate_response(model, tokenizer, full_prompt)
             print(f"\nResponse:\n{response}")
     
     except Exception as e:
         print(f"Critical error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         print("\nTroubleshooting tips:")
         print("1. Make sure the model path is correct")
         print("2. Ensure you have sufficient GPU memory if using CUDA")
