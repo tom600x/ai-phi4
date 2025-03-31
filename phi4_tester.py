@@ -1,8 +1,9 @@
 import torch
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import argparse
 
-def load_phi4_model(model_path="/home/TomAdmin/phi-4"):
+def load_phi4_model(model_path="/home/TomAdmin/phi-4", use_gpu=True):
     """Load the Phi-4 model and tokenizer from the specified path."""
     print(f"Loading Phi-4 model from {model_path}")
     
@@ -14,6 +15,19 @@ def load_phi4_model(model_path="/home/TomAdmin/phi-4"):
             raise ValueError(f"Model path {model_path} still does not exist!")
     
     print(f"Using model path: {model_path}")
+    
+    # Determine device based on user preference and availability
+    if use_gpu and torch.cuda.is_available():
+        device_map = "auto"
+        print(f"Using GPU - CUDA available with {torch.cuda.device_count()} device(s)")
+        print(f"GPU Model: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        if use_gpu and not torch.cuda.is_available():
+            print("GPU requested but CUDA is not available. Falling back to CPU.")
+        else:
+            print("Using CPU as requested.")
+        device_map = "cpu"
     
     try:
         # Load tokenizer and model directly from the local path
@@ -29,8 +43,8 @@ def load_phi4_model(model_path="/home/TomAdmin/phi-4"):
         
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
-            device_map="auto",
+            torch_dtype=torch.float16 if device_map == "auto" else torch.float32,  # Use float32 for CPU
+            device_map=device_map,
             trust_remote_code=True,
             local_files_only=True
         )
@@ -126,16 +140,30 @@ def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7)
         return f"Error generating response: {str(e)}"
 
 def main():
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description="Run Phi-4 model with GPU or CPU")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU usage even if GPU is available")
+    parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi4", 
+                        help="Path to the Phi-4 model directory")
+    parser.add_argument("--max-length", type=int, default=200,
+                        help="Maximum length of generated text")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Temperature for text generation (higher = more random)")
+    
+    args = parser.parse_args()
+    
     try:
-        # Load the model and tokenizer
-        model, tokenizer = load_phi4_model()
+        # Load the model and tokenizer with GPU/CPU preference
+        model, tokenizer = load_phi4_model(model_path=args.model_path, use_gpu=not args.cpu)
         
         # Test with a single prompt first to verify functionality
         print("\nTesting model with a simple prompt...")
         test_prompt = "Write a short story about a robot learning to feel emotions."
         print(f"Test prompt: '{test_prompt}'")
         
-        test_response = generate_response(model, tokenizer, test_prompt, max_length=200)
+        test_response = generate_response(model, tokenizer, test_prompt, 
+                                          max_length=args.max_length, 
+                                          temperature=args.temperature)
         print(f"Response: {test_response}\n")
         
         # Interactive mode
@@ -146,7 +174,9 @@ def main():
                 break
             
             print("Generating response...")
-            response = generate_response(model, tokenizer, user_input)
+            response = generate_response(model, tokenizer, user_input, 
+                                        max_length=args.max_length,
+                                        temperature=args.temperature)
             print(f"\nResponse:\n{response}")
     
     except Exception as e:
@@ -158,7 +188,7 @@ def main():
         print("2. Ensure you have sufficient GPU memory if using CUDA")
         print("3. Verify that all required libraries are installed: transformers, torch")
         print("4. Try updating libraries: pip install -U transformers torch")
-        print("5. Try with device_map=\"cpu\" if having GPU memory issues")
+        print("5. Try with --cpu flag if having GPU memory issues")
         print("6. Check the model's specific requirements in its documentation")
 
 if __name__ == "__main__":
