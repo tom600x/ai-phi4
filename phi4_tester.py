@@ -157,14 +157,14 @@ def main():
         model, tokenizer = load_phi4_model(model_path=args.model_path, use_gpu=not args.cpu)
         
         # Test with a single prompt first to verify functionality
-        print("\nTesting model with a simple prompt...")
-        test_prompt = "Write a short story about a robot learning to feel emotions."
-        print(f"Test prompt: '{test_prompt}'")
+   #    print("\nTesting model with a simple prompt...")
+   #     test_prompt = "Write a short story about a robot learning to feel emotions."
+  #     print(f"Test prompt: '{test_prompt}'")
         
-        test_response = generate_response(model, tokenizer, test_prompt, 
-                                          max_length=args.max_length, 
-                                          temperature=args.temperature)
-        print(f"Response: {test_response}\n")
+   #     test_response = generate_response(model, tokenizer, test_prompt, 
+    #                                      max_length=args.max_length, 
+    #                                      temperature=args.temperature)
+    #    print(f"Response: {test_response}\n")
         
         # Interactive mode
         print("\nEntering interactive mode. Type 'exit' to quit.")
