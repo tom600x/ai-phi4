@@ -37,13 +37,9 @@ def load_phi4_model(model_path="/home/TomAdmin/phi-4", use_gpu=True):
             local_files_only=True
         )
         
-        # Ensure the tokenizer has proper pad token and EOS token
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16 if device_map == "auto" else torch.float32,  # Use float32 for CPU
+            torch_dtype=torch.float16 if device_map == "auto" else torch.float32,
             device_map=device_map,
             trust_remote_code=True,
             local_files_only=True
@@ -51,12 +47,7 @@ def load_phi4_model(model_path="/home/TomAdmin/phi-4", use_gpu=True):
         
         # Print model and tokenizer info for debugging
         print(f"Model type: {type(model).__name__}")
-        print(f"Tokenizer type: {type(tokenizer).__name__}")
         print(f"Model device: {next(model.parameters()).device}")
-        print(f"Vocab size: {len(tokenizer)}")
-        print(f"EOS token: {tokenizer.eos_token}, ID: {tokenizer.eos_token_id}")
-        print(f"PAD token: {tokenizer.pad_token}, ID: {tokenizer.pad_token_id}")
-        
         print("Model and tokenizer loaded successfully!")
         return model, tokenizer
     except Exception as e:
@@ -64,72 +55,28 @@ def load_phi4_model(model_path="/home/TomAdmin/phi-4", use_gpu=True):
         raise
 
 def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7):
-    """Generate a response using the Phi-4 model."""
+    """Generate a response using the Phi-4 model using the simple approach from test_phi4.py."""
     try:
         print(f"Processing prompt: '{prompt}'")
         
-        # Tokenize input with attention mask
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,  # Prevent overly long inputs
-            return_attention_mask=True
+        # Simple tokenization like in test_phi4.py
+        inputs = tokenizer(prompt, return_tensors="pt")
+        
+        # Move inputs to the model device
+        inputs = {k: v.to(next(model.parameters()).device) for k, v in inputs.items()}
+        
+        # Simple generation parameters like in test_phi4.py but with some temperature control
+        output = model.generate(
+            **inputs, 
+            max_length=max_length,
+            temperature=temperature,
+            do_sample=True
         )
         
-        # Move inputs to the same device as model
-        device = next(model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        # Decode the full output
+        response = tokenizer.decode(output[0], skip_special_tokens=True)
         
-        input_length = inputs["input_ids"].shape[1]
-        print(f"Input length: {input_length} tokens")
-        print(f"Input IDs: {inputs['input_ids'][0].tolist()[:10]}...")
-        
-        # Generate response - explicitly defining all parameters
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=max_length,  # Generate this many new tokens
-                min_new_tokens=10,  # Force generation of at least 10 tokens
-                temperature=temperature,
-                do_sample=True,
-                top_p=0.92,
-                top_k=50,
-                repetition_penalty=1.2,
-                no_repeat_ngram_size=3,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,
-            )
-            
-            total_tokens = outputs.shape[1]
-            new_tokens = total_tokens - input_length
-            print(f"Total generated tokens: {total_tokens}")
-            print(f"New tokens: {new_tokens}")
-            
-            if new_tokens <= 0:
-                print("WARNING: No new tokens generated!")
-                print(f"Output shape: {outputs.shape}")
-                print(f"First few output tokens: {outputs[0][:10].tolist()}")
-        
-        # Only extract the new tokens if we actually generated new ones
-        if new_tokens > 0:
-            # Extract only the newly generated tokens (skip the input)
-            new_tokens_tensor = outputs[0, input_length:]
-            response = tokenizer.decode(new_tokens_tensor, skip_special_tokens=True)
-        else:
-            # If no new tokens, try decoding the whole output
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            # Try to remove the input prompt if possible
-            if prompt in response:
-                response = response[len(prompt):].strip()
-            else:
-                response = "Model did not generate any response."
-        
-        print(f"Response generated successfully! Length: {len(response)} chars")
-        print(f"Response preview: {response[:100] + '...' if len(response) > 100 else response}")
+        print(f"Response generated! Length: {len(response)} chars")
         
         return response
     
@@ -143,7 +90,7 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Run Phi-4 model with GPU or CPU")
     parser.add_argument("--cpu", action="store_true", help="Force CPU usage even if GPU is available")
-    parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi4", 
+    parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi-4", 
                         help="Path to the Phi-4 model directory")
     parser.add_argument("--max-length", type=int, default=200,
                         help="Maximum length of generated text")
@@ -156,15 +103,15 @@ def main():
         # Load the model and tokenizer with GPU/CPU preference
         model, tokenizer = load_phi4_model(model_path=args.model_path, use_gpu=not args.cpu)
         
-        # Test with a single prompt first to verify functionality
-   #    print("\nTesting model with a simple prompt...")
-   #     test_prompt = "Write a short story about a robot learning to feel emotions."
-  #     print(f"Test prompt: '{test_prompt}'")
+        # Test with a single prompt
+        print("\nTesting model with a simple prompt...")
+        test_prompt = "Hello, how are you?"
+        print(f"Test prompt: '{test_prompt}'")
         
-   #     test_response = generate_response(model, tokenizer, test_prompt, 
-    #                                      max_length=args.max_length, 
-    #                                      temperature=args.temperature)
-    #    print(f"Response: {test_response}\n")
+        test_response = generate_response(model, tokenizer, test_prompt, 
+                                          max_length=args.max_length, 
+                                          temperature=args.temperature)
+        print(f"Response: {test_response}\n")
         
         # Interactive mode
         print("\nEntering interactive mode. Type 'exit' to quit.")
@@ -186,10 +133,7 @@ def main():
         print("\nTroubleshooting tips:")
         print("1. Make sure the model path is correct and contains all necessary files")
         print("2. Ensure you have sufficient GPU memory if using CUDA")
-        print("3. Verify that all required libraries are installed: transformers, torch")
-        print("4. Try updating libraries: pip install -U transformers torch")
-        print("5. Try with --cpu flag if having GPU memory issues")
-        print("6. Check the model's specific requirements in its documentation")
+        print("3. Try with --cpu flag if having GPU memory issues")
 
 if __name__ == "__main__":
     main()
