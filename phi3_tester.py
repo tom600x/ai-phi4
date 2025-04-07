@@ -90,7 +90,7 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Run Phi-3 model with GPU or CPU")
     parser.add_argument("--cpu", action="store_true", help="Force CPU usage even if GPU is available")
-    parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi-3", 
+    parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi-3-mini-128k-instruct", 
                         help="Path to the Phi-3 model directory")
     parser.add_argument("--max-length", type=int, default=200,
                         help="Maximum length of generated text")
