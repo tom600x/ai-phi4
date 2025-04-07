@@ -2,8 +2,11 @@ import torch
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import argparse
+import gc
+import psutil
+import platform
 
-def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-128k-instruct", use_gpu=True):
+def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-128k-instruct", use_gpu=False, low_memory=True):
     """Load the Phi-3 model and tokenizer from the specified path."""
     print(f"Loading Phi-3 model from {model_path}")
     
@@ -16,38 +19,77 @@ def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-128k-instruct", use_gp
     
     print(f"Using model path: {model_path}")
     
-    # Determine device based on user preference and availability
-    if use_gpu and torch.cuda.is_available():
+    # Print system information
+    print("\nSystem Information:")
+    print(f"OS: {platform.system()} {platform.version()}")
+    print(f"Python: {platform.python_version()}")
+    print(f"CPU: {platform.processor()}")
+    
+    # Memory information
+    mem_info = psutil.virtual_memory()
+    print(f"Total RAM: {mem_info.total / 1e9:.2f} GB")
+    print(f"Available RAM: {mem_info.available / 1e9:.2f} GB")
+    print(f"Used RAM: {mem_info.used / 1e9:.2f} GB ({mem_info.percent}%)")
+    
+    # Force CPU usage if requested or if GPU not available
+    if not use_gpu or not torch.cuda.is_available():
+        if use_gpu and not torch.cuda.is_available():
+            print("GPU requested but CUDA is not available. Using CPU.")
+        else:
+            print("Using CPU as requested.")
+        device_map = "cpu"
+        # Set PyTorch to only use CPU
+        torch.set_num_threads(psutil.cpu_count(logical=True))
+        print(f"Using {torch.get_num_threads()} CPU threads")
+    else:
         device_map = "auto"
         print(f"Using GPU - CUDA available with {torch.cuda.device_count()} device(s)")
         print(f"GPU Model: {torch.cuda.get_device_name(0)}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    else:
-        if use_gpu and not torch.cuda.is_available():
-            print("GPU requested but CUDA is not available. Falling back to CPU.")
-        else:
-            print("Using CPU as requested.")
-        device_map = "cpu"
+    
+    # Call garbage collection before loading model
+    gc.collect()
     
     try:
-        # Load tokenizer and model directly from the local path
+        # Load tokenizer
+        print("Loading tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=True,
             local_files_only=True
         )
         
+        # Load model with optimizations for CPU
+        print("Loading model (this may take a while on CPU)...")
+        
+        # Memory optimization options for CPU
+        model_kwargs = {
+            "trust_remote_code": True,
+            "local_files_only": True,
+            "device_map": device_map
+        }
+        
+        # Add CPU-specific optimizations
+        if device_map == "cpu":
+            model_kwargs["torch_dtype"] = torch.float32  # Use float32 on CPU for better compatibility
+            if low_memory:
+                model_kwargs["load_in_8bit"] = True  # 8-bit quantization for lower memory usage
+        else:
+            model_kwargs["torch_dtype"] = torch.float16
+        
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16 if device_map == "auto" else torch.float32,
-            device_map=device_map,
-            trust_remote_code=True,
-            local_files_only=True
+            **model_kwargs
         )
         
-        # Print model and tokenizer info for debugging
+        # Print model and tokenizer info
         print(f"Model type: {type(model).__name__}")
         print(f"Model device: {next(model.parameters()).device}")
+        
+        # Memory usage after loading
+        mem_info = psutil.virtual_memory()
+        print(f"RAM usage after model loading: {mem_info.used / 1e9:.2f} GB ({mem_info.percent}%)")
+        
         print("Model and tokenizer loaded successfully!")
         return model, tokenizer
     except Exception as e:
@@ -59,24 +101,44 @@ def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7)
     try:
         print(f"Processing prompt: '{prompt}'")
         
+        # Memory usage before inference
+        mem_before = psutil.virtual_memory()
+        print(f"RAM before inference: {mem_before.used / 1e9:.2f} GB ({mem_before.percent}%)")
+        
         # Simple tokenization
         inputs = tokenizer(prompt, return_tensors="pt")
         
         # Move inputs to the model device
-        inputs = {k: v.to(next(model.parameters()).device) for k, v in inputs.items()}
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         
-        # Generation parameters
-        output = model.generate(
-            **inputs, 
-            max_length=max_length,
-            temperature=temperature,
-            do_sample=True
-        )
+        # CPU-friendly generation parameters
+        generate_kwargs = {
+            "max_length": max_length,
+            "temperature": temperature,
+            "do_sample": True
+        }
+        
+        # For CPU, add more efficiency options
+        if device.type == "cpu":
+            generate_kwargs["num_beams"] = 1  # Reduce beam search complexity
+        
+        # Generation
+        print("Generating response (this may take longer on CPU)...")
+        output = model.generate(**inputs, **generate_kwargs)
         
         # Decode the full output
         response = tokenizer.decode(output[0], skip_special_tokens=True)
         
+        # Memory usage after inference
+        mem_after = psutil.virtual_memory()
+        print(f"RAM after inference: {mem_after.used / 1e9:.2f} GB ({mem_after.percent}%)")
+        
         print(f"Response generated! Length: {len(response)} chars")
+        
+        # Clean up to free memory
+        del output
+        gc.collect()
         
         return response
     
@@ -88,20 +150,34 @@ def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7)
 
 def main():
     # Set up argument parser
-    parser = argparse.ArgumentParser(description="Run Phi-3 model with GPU or CPU")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU usage even if GPU is available")
+    parser = argparse.ArgumentParser(description="Run Phi-3 model with CPU optimizations")
+    parser.add_argument("--gpu", action="store_true", help="Use GPU if available (default is CPU-only)")
     parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi-3-mini-128k-instruct", 
                         help="Path to the Phi-3 model directory")
     parser.add_argument("--max-length", type=int, default=200,
                         help="Maximum length of generated text")
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Temperature for text generation (higher = more random)")
+    parser.add_argument("--low-memory", action="store_true", 
+                        help="Enable 8-bit quantization for lower memory usage")
     
     args = parser.parse_args()
     
     try:
-        # Load the model and tokenizer with GPU/CPU preference
-        model, tokenizer = load_phi3_model(model_path=args.model_path, use_gpu=not args.cpu)
+        # Show intro message
+        print("=" * 50)
+        print("Phi-3 CPU Tester")
+        print("=" * 50)
+        print("This script is optimized for CPU usage.")
+        print("Loading and inference will be slower than on GPU but more memory-efficient.")
+        print("=" * 50)
+        
+        # Load the model and tokenizer with CPU optimizations
+        model, tokenizer = load_phi3_model(
+            model_path=args.model_path, 
+            use_gpu=args.gpu,
+            low_memory=args.low_memory
+        )
         
         # Test with a single prompt
         print("\nTesting model with a simple prompt...")
@@ -125,6 +201,9 @@ def main():
                                         max_length=args.max_length,
                                         temperature=args.temperature)
             print(f"\nResponse:\n{response}")
+            
+            # Clear some memory between generations
+            gc.collect()
     
     except Exception as e:
         print(f"Critical error: {str(e)}")
@@ -132,8 +211,11 @@ def main():
         traceback.print_exc()
         print("\nTroubleshooting tips:")
         print("1. Make sure the model path is correct and contains all necessary files")
-        print("2. Ensure you have sufficient GPU memory if using CUDA")
-        print("3. Try with --cpu flag if having GPU memory issues")
+        print("2. If you're getting out-of-memory errors:")
+        print("   - Try with --low-memory flag for 8-bit quantization")
+        print("   - Consider using a smaller model variant")
+        print("   - Close other applications to free up memory")
+        print("3. Be patient, CPU inference is much slower than GPU")
 
 if __name__ == "__main__":
     main()
