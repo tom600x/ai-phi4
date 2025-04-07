@@ -169,34 +169,97 @@ def generate_response(model, tokenizer, prompt, temperature=0.7):
         generate_kwargs = {
             "max_new_tokens": 500,  # Set a limit on new tokens instead of max_length
             "temperature": temperature,
-            "do_sample": True
+            "do_sample": True,
+            "pad_token_id": tokenizer.eos_token_id,  # Fix padding token issues
+            "use_cache": True  # Ensure caching is enabled
         }
         
         # For CPU, add more efficiency options
         if device.type == "cpu":
             generate_kwargs["num_beams"] = 1  # Reduce beam search complexity
         
-        # Patch for newer transformers versions with DynamicCache
+        print("Generating response (this may take longer on CPU)...")
+        
+        # Try different approaches to handle compatibility issues
         try:
-            # Try the new generation approach first
-            print("Generating response (this may take longer on CPU)...")
-            # Use a different method that doesn't rely on get_max_length
-            output = model.generate(**inputs, **generate_kwargs)
-        except AttributeError as e:
-            if "get_max_length" in str(e):
-                print("Detected newer transformers version, trying alternative approach...")
-                # Monkey patch the required method if it's missing
-                from transformers.cache_utils import DynamicCache
-                if not hasattr(DynamicCache, "get_max_length"):
-                    print("Adding get_max_length method to DynamicCache")
-                    DynamicCache.get_max_length = lambda self: self.get_seq_length()
-                # Try again with the patch
+            # Approach 1: Most straightforward approach with handling for DynamicCache
+            try:
+                # Try the standard generation approach first
                 output = model.generate(**inputs, **generate_kwargs)
+            except AttributeError as e:
+                if "get_max_length" in str(e):
+                    print("Detected newer transformers version, trying alternative approach...")
+                    # Monkey patch the required method if it's missing
+                    from transformers.cache_utils import DynamicCache
+                    if not hasattr(DynamicCache, "get_max_length"):
+                        print("Adding get_max_length method to DynamicCache")
+                        DynamicCache.get_max_length = lambda self: self.get_seq_length()
+                    # Try again with the patch
+                    output = model.generate(**inputs, **generate_kwargs)
+                else:
+                    raise e
+                    
+        except RuntimeError as e:
+            if "size of tensor" in str(e):
+                print("Tensor size mismatch detected, trying alternative generation approach...")
+                
+                # Approach 2: Basic greedy generation to avoid tensor size issues
+                print("Trying basic generation without sampling...")
+                generate_kwargs["do_sample"] = False
+                generate_kwargs["num_beams"] = 1
+                try:
+                    output = model.generate(**inputs, **generate_kwargs)
+                except Exception as e2:
+                    print(f"Basic generation also failed: {str(e2)}")
+                    
+                    # Approach 3: Manual generation one token at a time
+                    print("Trying manual token-by-token generation...")
+                    input_ids = inputs["input_ids"]
+                    generated_tokens = []
+                    max_tokens = generate_kwargs.get("max_new_tokens", 500)
+                    
+                    # Generate tokens one by one to avoid tensor mismatches
+                    for _ in range(max_tokens):
+                        try:
+                            with torch.no_grad():
+                                outputs = model(input_ids=input_ids)
+                            
+                            next_token = torch.argmax(outputs.logits[:, -1], dim=-1).unsqueeze(-1)
+                            generated_tokens.append(next_token.item())
+                            input_ids = torch.cat([input_ids, next_token], dim=-1)
+                            
+                            # Stop if we generate an EOS token
+                            if next_token.item() == tokenizer.eos_token_id:
+                                break
+                                
+                        except Exception as e3:
+                            print(f"Manual generation failed: {str(e3)}")
+                            break
+                    
+                    # Convert generated tokens to a tensor like normal output
+                    all_tokens = torch.cat([inputs["input_ids"], torch.tensor([generated_tokens], device=device)], dim=-1)
+                    output = all_tokens
             else:
                 raise e
         
-        # Decode the full output
-        response = tokenizer.decode(output[0], skip_special_tokens=True)
+        # Decode the output appropriately
+        try:
+            # Standard decoding for normal generation
+            response = tokenizer.decode(output[0], skip_special_tokens=True)
+        except Exception as e:
+            # Fallback decoding
+            print(f"Standard decoding failed: {str(e)}, trying alternative decoding")
+            try:
+                if isinstance(output, list):
+                    response = tokenizer.decode(output, skip_special_tokens=True)
+                elif hasattr(output, "sequences"):
+                    response = tokenizer.decode(output.sequences[0], skip_special_tokens=True)
+                else:
+                    # Last resort
+                    all_tokens = input_ids[0].tolist()
+                    response = tokenizer.decode(all_tokens, skip_special_tokens=True)
+            except Exception as e2:
+                response = f"Unable to decode response: {str(e2)}"
         
         # Memory usage after inference
         mem_after = psutil.virtual_memory()
