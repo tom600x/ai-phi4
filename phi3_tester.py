@@ -165,8 +165,9 @@ def generate_response(model, tokenizer, prompt, temperature=0.7):
         device = next(model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
         
-        # CPU-friendly generation parameters
+        # CPU-friendly generation parameters with max_new_tokens instead of max_length
         generate_kwargs = {
+            "max_new_tokens": 500,  # Set a limit on new tokens instead of max_length
             "temperature": temperature,
             "do_sample": True
         }
@@ -175,9 +176,24 @@ def generate_response(model, tokenizer, prompt, temperature=0.7):
         if device.type == "cpu":
             generate_kwargs["num_beams"] = 1  # Reduce beam search complexity
         
-        # Generation
-        print("Generating response (this may take longer on CPU)...")
-        output = model.generate(**inputs, **generate_kwargs)
+        # Patch for newer transformers versions with DynamicCache
+        try:
+            # Try the new generation approach first
+            print("Generating response (this may take longer on CPU)...")
+            # Use a different method that doesn't rely on get_max_length
+            output = model.generate(**inputs, **generate_kwargs)
+        except AttributeError as e:
+            if "get_max_length" in str(e):
+                print("Detected newer transformers version, trying alternative approach...")
+                # Monkey patch the required method if it's missing
+                from transformers.cache_utils import DynamicCache
+                if not hasattr(DynamicCache, "get_max_length"):
+                    print("Adding get_max_length method to DynamicCache")
+                    DynamicCache.get_max_length = lambda self: self.get_seq_length()
+                # Try again with the patch
+                output = model.generate(**inputs, **generate_kwargs)
+            else:
+                raise e
         
         # Decode the full output
         response = tokenizer.decode(output[0], skip_special_tokens=True)
