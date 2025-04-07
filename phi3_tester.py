@@ -1,19 +1,22 @@
 import torch
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import numpy as np
+from transformers import AutoTokenizer
 import argparse
 import gc
 import psutil
 import platform
+from typing import Dict, List, Union, Optional
+import onnxruntime as ort
 
-def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-128k-instruct", use_gpu=False, low_memory=True):
-    """Load the Phi-3 model and tokenizer from the specified path."""
-    print(f"Loading Phi-3 model from {model_path}")
+def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-4k-instruct-onnx", use_gpu=False, low_memory=True):
+    """Load the Phi-3 ONNX model and tokenizer from the specified path."""
+    print(f"Loading Phi-3 ONNX model from {model_path}")
     
     # Check if the model path exists
     if not os.path.exists(model_path):
         print(f"WARNING: Model path {model_path} does not exist!")
-        model_path = input("Please enter the correct path to the phi3 model: ")
+        model_path = input("Please enter the correct path to the phi3 ONNX model: ")
         if not os.path.exists(model_path):
             raise ValueError(f"Model path {model_path} still does not exist!")
     
@@ -31,21 +34,22 @@ def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-128k-instruct", use_gp
     print(f"Available RAM: {mem_info.available / 1e9:.2f} GB")
     print(f"Used RAM: {mem_info.used / 1e9:.2f} GB ({mem_info.percent}%)")
     
-    # Force CPU usage if requested or if GPU not available
-    if not use_gpu or not torch.cuda.is_available():
-        if use_gpu and not torch.cuda.is_available():
-            print("GPU requested but CUDA is not available. Using CPU.")
+    # Determine provider based on hardware and user preference
+    provider_options = []
+    
+    if use_gpu and ('CUDAExecutionProvider' in ort.get_available_providers()):
+        print("Using GPU with CUDA for inference.")
+        provider_options = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    else:
+        if use_gpu and 'CUDAExecutionProvider' not in ort.get_available_providers():
+            print("GPU requested but CUDA provider not available. Using CPU.")
         else:
             print("Using CPU as requested.")
-        device_map = "cpu"
-        # Set PyTorch to only use CPU
-        torch.set_num_threads(psutil.cpu_count(logical=True))
-        print(f"Using {torch.get_num_threads()} CPU threads")
-    else:
-        device_map = "auto"
-        print(f"Using GPU - CUDA available with {torch.cuda.device_count()} device(s)")
-        print(f"GPU Model: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        provider_options = ['CPUExecutionProvider']
+        
+        # Set number of threads for CPU
+        thread_count = psutil.cpu_count(logical=True)
+        print(f"Using {thread_count} CPU threads")
     
     # Call garbage collection before loading model
     gc.collect()
@@ -59,216 +63,199 @@ def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-128k-instruct", use_gp
             local_files_only=True
         )
         
-        # Load model with optimizations for CPU
-        print("Loading model (this may take a while on CPU)...")
+        # Check if model file exists
+        model_files = [f for f in os.listdir(model_path) if f.endswith('.onnx')]
+        if not model_files:
+            raise FileNotFoundError(f"No .onnx files found in {model_path}")
         
-        # Memory optimization options for CPU
-        model_kwargs = {
-            "trust_remote_code": True,
-            "local_files_only": True,
-            "device_map": device_map,
-            "attn_implementation": "eager"  # Avoid flash attention issues
-        }
+        print(f"Found ONNX model files: {model_files}")
         
-        # Add CPU-specific optimizations
-        if device_map == "cpu":
-            model_kwargs["torch_dtype"] = torch.float32  # Use float32 on CPU for better compatibility
-            # 8-bit quantization was causing "init_empty_weights" error, so we'll use a different approach
-            if low_memory:
-                try:
-                    # First try with 8-bit if bitsandbytes is installed
-                    import bitsandbytes
-                    model_kwargs["load_in_8bit"] = True
-                    print("Using 8-bit quantization for lower memory usage")
-                except ImportError:
-                    # Fall back to 4-bit if supported
-                    try:
-                        from transformers import BitsAndBytesConfig
-                        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                            load_in_4bit=True,
-                            bnb_4bit_compute_dtype=torch.float32
-                        )
-                        print("Using 4-bit quantization for lower memory usage")
-                    except (ImportError, AttributeError):
-                        # If all else fails, load with default settings
-                        print("Quantization libraries not available. Loading model with standard settings.")
-                        if "load_in_8bit" in model_kwargs:
-                            del model_kwargs["load_in_8bit"]
-        else:
-            model_kwargs["torch_dtype"] = torch.float16
-        
-        # Try to import accelerate explicitly to avoid init_empty_weights error
-        try:
-            import accelerate
-            from accelerate import init_empty_weights
-            print(f"Using accelerate version: {accelerate.__version__}")
-        except ImportError:
-            print("Accelerate package not found. This might cause issues with model loading.")
-        except AttributeError:
-            print("Your version of accelerate doesn't have init_empty_weights. Using alternative loading method.")
-        
-        # Load the model with error handling for different transformers versions
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                **model_kwargs
-            )
-        except (NameError, AttributeError) as e:
-            if "init_empty_weights" in str(e):
-                print("Encountered init_empty_weights error. Trying alternative loading method...")
-                # Try loading with CPU first then moving if needed
-                cpu_kwargs = model_kwargs.copy()
-                cpu_kwargs["device_map"] = None  # Don't use device_map
-                if "load_in_8bit" in cpu_kwargs:
-                    del cpu_kwargs["load_in_8bit"]  # Remove quantization that might cause issues
-                if "quantization_config" in cpu_kwargs:
-                    del cpu_kwargs["quantization_config"]
-                
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    **cpu_kwargs
-                )
-                
-                # Now move to the right device if needed
-                if device_map != "cpu" and torch.cuda.is_available():
-                    model = model.to("cuda")
+        # Determine main model file - typically model.onnx or something similar
+        main_model_file = "model.onnx"
+        if "model.onnx" not in model_files:
+            # Try to find a suitable model file
+            if len(model_files) == 1:
+                main_model_file = model_files[0]
             else:
-                raise e
+                # Look for likely candidates
+                for file in model_files:
+                    if "decoder" in file.lower() or "model" in file.lower():
+                        main_model_file = file
+                        break
+                else:
+                    main_model_file = model_files[0]  # Use the first one if no better match
         
-        # Print model and tokenizer info
-        print(f"Model type: {type(model).__name__}")
-        print(f"Model device: {next(model.parameters()).device}")
+        model_path_full = os.path.join(model_path, main_model_file)
+        print(f"Loading ONNX model from: {model_path_full}")
+        
+        # Set up session options
+        sess_options = ort.SessionOptions()
+        
+        if low_memory:
+            print("Enabling memory optimizations for lower memory usage")
+            sess_options.enable_mem_pattern = True
+            sess_options.enable_mem_reuse = True
+            sess_options.optimize_for_inference = True
+            
+            if 'CPUExecutionProvider' in provider_options:
+                # Memory optimizations for CPU
+                sess_options.intra_op_num_threads = thread_count
+                
+        # Create ONNX runtime session
+        session = ort.InferenceSession(
+            model_path_full, 
+            sess_options=sess_options,
+            providers=provider_options
+        )
+        
+        # Get model metadata
+        model_metadata = session.get_modelmeta()
+        print(f"Model producer: {model_metadata.producer_name}")
+        print(f"Graph inputs: {session.get_inputs()}")
         
         # Memory usage after loading
         mem_info = psutil.virtual_memory()
-        print(f"RAM usage after model loading: {mem_info.used / 1e9:.2f} GB ({mem_info.percent}%)")
+        print(f"RAM usage after model loading: {mem_info.used / 1e9:.2f GB ({mem_info.percent}%)")
         
         print("Model and tokenizer loaded successfully!")
-        return model, tokenizer
+        return session, tokenizer
     except Exception as e:
         print(f"Error loading model: {str(e)}")
         raise
 
-def generate_response(model, tokenizer, prompt, temperature=0.7):
-    """Generate a response using the Phi-3 model."""
+def generate_response(session, tokenizer, prompt, temperature=0.7):
+    """Generate a response using the Phi-3 ONNX model."""
     try:
         print(f"Processing prompt: '{prompt}'")
         
         # Memory usage before inference
         mem_before = psutil.virtual_memory()
-        print(f"RAM before inference: {mem_before.used / 1e9:.2f} GB ({mem_before.percent}%)")
+        print(f"RAM before inference: {mem_before.used / 1e9:.2f GB ({mem_before.percent}%)")
         
-        # Simple tokenization
-        inputs = tokenizer(prompt, return_tensors="pt")
+        # Tokenize input
+        input_tokens = tokenizer(prompt, return_tensors="np")
+        input_ids = input_tokens["input_ids"]
         
-        # Move inputs to the model device
-        device = next(model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        # Get the input names from the model
+        input_names = [input.name for input in session.get_inputs()]
+        output_names = [output.name for output in session.get_outputs()]
         
-        # CPU-friendly generation parameters with max_new_tokens instead of max_length
-        generate_kwargs = {
-            "max_new_tokens": 500,  # Set a limit on new tokens instead of max_length
-            "temperature": temperature,
-            "do_sample": True,
-            "pad_token_id": tokenizer.eos_token_id,  # Fix padding token issues
-            "use_cache": True  # Ensure caching is enabled
-        }
+        print(f"Model input names: {input_names}")
+        print(f"Model output names: {output_names}")
         
-        # For CPU, add more efficiency options
-        if device.type == "cpu":
-            generate_kwargs["num_beams"] = 1  # Reduce beam search complexity
+        # For greedy decoding
+        max_new_tokens = 500
+        eos_token_id = tokenizer.eos_token_id
         
+        # Manual generation loop
         print("Generating response (this may take longer on CPU)...")
+        all_tokens = input_ids.copy()
         
-        # Try different approaches to handle compatibility issues
         try:
-            # Approach 1: Most straightforward approach with handling for DynamicCache
-            try:
-                # Try the standard generation approach first
-                output = model.generate(**inputs, **generate_kwargs)
-            except AttributeError as e:
-                if "get_max_length" in str(e):
-                    print("Detected newer transformers version, trying alternative approach...")
-                    # Monkey patch the required method if it's missing
-                    from transformers.cache_utils import DynamicCache
-                    if not hasattr(DynamicCache, "get_max_length"):
-                        print("Adding get_max_length method to DynamicCache")
-                        DynamicCache.get_max_length = lambda self: self.get_seq_length()
-                    # Try again with the patch
-                    output = model.generate(**inputs, **generate_kwargs)
-                else:
-                    raise e
-                    
-        except RuntimeError as e:
-            if "size of tensor" in str(e):
-                print("Tensor size mismatch detected, trying alternative generation approach...")
+            # Try to prepare full inputs based on the expected input names
+            ort_inputs = {}
+            
+            # Common input name patterns
+            if "input_ids" in input_names:
+                ort_inputs["input_ids"] = input_ids.astype(np.int64)
+            
+            # Add attention mask if needed
+            if "attention_mask" in input_names:
+                attention_mask = np.ones(input_ids.shape, dtype=np.int64)
+                ort_inputs["attention_mask"] = attention_mask
                 
-                # Approach 2: Basic greedy generation to avoid tensor size issues
-                print("Trying basic generation without sampling...")
-                generate_kwargs["do_sample"] = False
-                generate_kwargs["num_beams"] = 1
-                try:
-                    output = model.generate(**inputs, **generate_kwargs)
-                except Exception as e2:
-                    print(f"Basic generation also failed: {str(e2)}")
+            # Add any other required inputs with default values
+            for name in input_names:
+                if name not in ort_inputs:
+                    if "position" in name or "index" in name:
+                        ort_inputs[name] = np.array([0], dtype=np.int64)
+                    elif "past" in name or "cache" in name:
+                        # For past key/value caches, typically start with None
+                        ort_inputs[name] = np.array([0], dtype=np.int64)
+            
+            # For one-shot inference without caching (simplified approach)
+            if len(output_names) == 1 and ("logits" in output_names[0] or "next_token" in output_names[0]):
+                # Simple output with just logits - do manual token generation
+                for _ in range(max_new_tokens):
+                    # Run inference to get next token logits
+                    outputs = session.run(output_names, ort_inputs)
                     
-                    # Approach 3: Manual generation one token at a time
-                    print("Trying manual token-by-token generation...")
-                    input_ids = inputs["input_ids"]
-                    generated_tokens = []
-                    max_tokens = generate_kwargs.get("max_new_tokens", 500)
+                    # Get logits from the last token
+                    if "logits" in output_names[0]:
+                        logits = outputs[0][0, -1, :]
+                    else:
+                        logits = outputs[0][0, :]
                     
-                    # Generate tokens one by one to avoid tensor mismatches
-                    for _ in range(max_tokens):
-                        try:
-                            with torch.no_grad():
-                                outputs = model(input_ids=input_ids)
-                            
-                            next_token = torch.argmax(outputs.logits[:, -1], dim=-1).unsqueeze(-1)
-                            generated_tokens.append(next_token.item())
-                            input_ids = torch.cat([input_ids, next_token], dim=-1)
-                            
-                            # Stop if we generate an EOS token
-                            if next_token.item() == tokenizer.eos_token_id:
-                                break
-                                
-                        except Exception as e3:
-                            print(f"Manual generation failed: {str(e3)}")
-                            break
+                    # Apply temperature
+                    if temperature > 0:
+                        logits = logits / temperature
                     
-                    # Convert generated tokens to a tensor like normal output
-                    all_tokens = torch.cat([inputs["input_ids"], torch.tensor([generated_tokens], device=device)], dim=-1)
-                    output = all_tokens
+                    # Simple greedy sampling
+                    next_token_id = np.argmax(logits)
+                    
+                    # Append to generated tokens
+                    all_tokens = np.concatenate([all_tokens, np.array([[next_token_id]])], axis=1)
+                    
+                    # Update inputs for next iteration
+                    ort_inputs["input_ids"] = np.array([[next_token_id]], dtype=np.int64)
+                    if "attention_mask" in ort_inputs:
+                        ort_inputs["attention_mask"] = np.ones((1, 1), dtype=np.int64)
+                    
+                    # Check if we've generated the EOS token
+                    if next_token_id == eos_token_id:
+                        break
             else:
-                raise e
-        
-        # Decode the output appropriately
-        try:
-            # Standard decoding for normal generation
-            response = tokenizer.decode(output[0], skip_special_tokens=True)
+                # More complex model - run full inference in one go
+                # If we can't generate token by token, we'll try to run the whole model once
+                outputs = session.run(output_names, ort_inputs)
+                
+                # Try to extract something useful from the outputs
+                if any("token_ids" in name for name in output_names):
+                    # Find output with token_ids
+                    for i, name in enumerate(output_names):
+                        if "token_ids" in name or "output_ids" in name:
+                            all_tokens = outputs[i]
+                            break
         except Exception as e:
-            # Fallback decoding
-            print(f"Standard decoding failed: {str(e)}, trying alternative decoding")
+            print(f"Error during ONNX inference: {str(e)}")
+            print("Trying alternative approach with just input_ids...")
+            
+            # Simplified approach - just pass input_ids and try to get something back
             try:
-                if isinstance(output, list):
-                    response = tokenizer.decode(output, skip_special_tokens=True)
-                elif hasattr(output, "sequences"):
-                    response = tokenizer.decode(output.sequences[0], skip_special_tokens=True)
-                else:
-                    # Last resort
-                    all_tokens = input_ids[0].tolist()
-                    response = tokenizer.decode(all_tokens, skip_special_tokens=True)
+                outputs = session.run(None, {"input_ids": input_ids.astype(np.int64)})
+                if len(outputs) > 0 and hasattr(outputs[0], "shape") and len(outputs[0].shape) > 1:
+                    all_tokens = outputs[0]
             except Exception as e2:
-                response = f"Unable to decode response: {str(e2)}"
+                print(f"Alternative approach also failed: {str(e2)}")
+                return f"Error: Unable to generate response with the ONNX model. {str(e)}"
+        
+        # Decode the generated tokens
+        try:
+            # Convert from numpy to list for tokenizer
+            if isinstance(all_tokens, np.ndarray):
+                if len(all_tokens.shape) > 1:
+                    token_ids = all_tokens[0].tolist()
+                else:
+                    token_ids = all_tokens.tolist()
+            else:
+                token_ids = all_tokens
+                
+            response = tokenizer.decode(token_ids, skip_special_tokens=True)
+            
+            # If the response still contains the prompt, extract only the new part
+            if prompt in response:
+                response = response[response.find(prompt) + len(prompt):]
+        except Exception as e:
+            print(f"Error during decoding: {str(e)}")
+            response = f"Error decoding response: {str(e)}"
         
         # Memory usage after inference
         mem_after = psutil.virtual_memory()
-        print(f"RAM after inference: {mem_after.used / 1e9:.2f} GB ({mem_after.percent}%)")
+        print(f"RAM after inference: {mem_after.used / 1e9:.2f GB ({mem_after.percent}%)")
         
         print(f"Response generated! Length: {len(response)} chars")
         
         # Clean up to free memory
-        del output
         gc.collect()
         
         return response
@@ -281,28 +268,28 @@ def generate_response(model, tokenizer, prompt, temperature=0.7):
 
 def main():
     # Set up argument parser
-    parser = argparse.ArgumentParser(description="Run Phi-3 model with CPU optimizations")
+    parser = argparse.ArgumentParser(description="Run Phi-3 ONNX model with CPU optimizations")
     parser.add_argument("--gpu", action="store_true", help="Use GPU if available (default is CPU-only)")
-    parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi-3-mini-128k-instruct", 
-                        help="Path to the Phi-3 model directory")
+    parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi-3-mini-4k-instruct-onnx", 
+                        help="Path to the Phi-3 ONNX model directory")
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Temperature for text generation (higher = more random)")
     parser.add_argument("--low-memory", action="store_true", 
-                        help="Enable 8-bit quantization for lower memory usage")
+                        help="Enable memory optimizations for lower memory usage")
     
     args = parser.parse_args()
     
     try:
         # Show intro message
         print("=" * 50)
-        print("Phi-3 CPU Tester")
+        print("Phi-3 ONNX Tester")
         print("=" * 50)
-        print("This script is optimized for CPU usage.")
-        print("Loading and inference will be slower than on GPU but more memory-efficient.")
+        print("This script is optimized for the ONNX version of Phi-3.")
+        print("ONNX provides better performance on CPU compared to PyTorch.")
         print("=" * 50)
         
-        # Load the model and tokenizer with CPU optimizations
-        model, tokenizer = load_phi3_model(
+        # Load the model and tokenizer with optimizations
+        session, tokenizer = load_phi3_model(
             model_path=args.model_path, 
             use_gpu=args.gpu,
             low_memory=args.low_memory
@@ -313,8 +300,8 @@ def main():
         test_prompt = "Hello, how are you?"
         print(f"Test prompt: '{test_prompt}'")
         
-        test_response = generate_response(model, tokenizer, test_prompt, 
-                                          temperature=args.temperature)
+        test_response = generate_response(session, tokenizer, test_prompt, 
+                                         temperature=args.temperature)
         print(f"Response: {test_response}\n")
         
         # Interactive mode
@@ -325,8 +312,8 @@ def main():
                 break
             
             print("Generating response...")
-            response = generate_response(model, tokenizer, user_input, 
-                                        temperature=args.temperature)
+            response = generate_response(session, tokenizer, user_input, 
+                                      temperature=args.temperature)
             print(f"\nResponse:\n{response}")
             
             # Clear some memory between generations
@@ -337,12 +324,13 @@ def main():
         import traceback
         traceback.print_exc()
         print("\nTroubleshooting tips:")
-        print("1. Make sure the model path is correct and contains all necessary files")
-        print("2. If you're getting out-of-memory errors:")
-        print("   - Try with --low-memory flag for 8-bit quantization")
-        print("   - Consider using a smaller model variant")
+        print("1. Make sure the model path is correct and contains the ONNX model files")
+        print("2. Install onnxruntime with: pip install onnxruntime")
+        print("3. For GPU support: pip install onnxruntime-gpu")
+        print("4. If you're getting out-of-memory errors:")
+        print("   - Try with --low-memory flag")
         print("   - Close other applications to free up memory")
-        print("3. Be patient, CPU inference is much slower than GPU")
+        print("5. Make sure your ONNX model is compatible - it should be the Phi-3-mini-4k-instruct-onnx version")
 
 if __name__ == "__main__":
     main()
