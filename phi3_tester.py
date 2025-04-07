@@ -149,7 +149,7 @@ def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-128k-instruct", use_gp
         print(f"Error loading model: {str(e)}")
         raise
 
-def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7):
+def generate_response(model, tokenizer, prompt, temperature=0.7):
     """Generate a response using the Phi-3 model."""
     try:
         print(f"Processing prompt: '{prompt}'")
@@ -167,7 +167,6 @@ def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7)
         
         # CPU-friendly generation parameters
         generate_kwargs = {
-            "max_length": max_length,
             "temperature": temperature,
             "do_sample": True
         }
@@ -207,8 +206,6 @@ def main():
     parser.add_argument("--gpu", action="store_true", help="Use GPU if available (default is CPU-only)")
     parser.add_argument("--model-path", type=str, default="/home/TomAdmin/phi-3-mini-128k-instruct", 
                         help="Path to the Phi-3 model directory")
-    parser.add_argument("--max-length", type=int, default=200,
-                        help="Maximum length of generated text")
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Temperature for text generation (higher = more random)")
     parser.add_argument("--low-memory", action="store_true", 
@@ -238,7 +235,6 @@ def main():
         print(f"Test prompt: '{test_prompt}'")
         
         test_response = generate_response(model, tokenizer, test_prompt, 
-                                          max_length=args.max_length, 
                                           temperature=args.temperature)
         print(f"Response: {test_response}\n")
         
@@ -251,7 +247,6 @@ def main():
             
             print("Generating response...")
             response = generate_response(model, tokenizer, user_input, 
-                                        max_length=args.max_length,
                                         temperature=args.temperature)
             print(f"\nResponse:\n{response}")
             
