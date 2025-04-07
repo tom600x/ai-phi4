@@ -66,21 +66,74 @@ def load_phi3_model(model_path="/home/TomAdmin/phi-3-mini-128k-instruct", use_gp
         model_kwargs = {
             "trust_remote_code": True,
             "local_files_only": True,
-            "device_map": device_map
+            "device_map": device_map,
+            "attn_implementation": "eager"  # Avoid flash attention issues
         }
         
         # Add CPU-specific optimizations
         if device_map == "cpu":
             model_kwargs["torch_dtype"] = torch.float32  # Use float32 on CPU for better compatibility
+            # 8-bit quantization was causing "init_empty_weights" error, so we'll use a different approach
             if low_memory:
-                model_kwargs["load_in_8bit"] = True  # 8-bit quantization for lower memory usage
+                try:
+                    # First try with 8-bit if bitsandbytes is installed
+                    import bitsandbytes
+                    model_kwargs["load_in_8bit"] = True
+                    print("Using 8-bit quantization for lower memory usage")
+                except ImportError:
+                    # Fall back to 4-bit if supported
+                    try:
+                        from transformers import BitsAndBytesConfig
+                        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=torch.float32
+                        )
+                        print("Using 4-bit quantization for lower memory usage")
+                    except (ImportError, AttributeError):
+                        # If all else fails, load with default settings
+                        print("Quantization libraries not available. Loading model with standard settings.")
+                        if "load_in_8bit" in model_kwargs:
+                            del model_kwargs["load_in_8bit"]
         else:
             model_kwargs["torch_dtype"] = torch.float16
         
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            **model_kwargs
-        )
+        # Try to import accelerate explicitly to avoid init_empty_weights error
+        try:
+            import accelerate
+            from accelerate import init_empty_weights
+            print(f"Using accelerate version: {accelerate.__version__}")
+        except ImportError:
+            print("Accelerate package not found. This might cause issues with model loading.")
+        except AttributeError:
+            print("Your version of accelerate doesn't have init_empty_weights. Using alternative loading method.")
+        
+        # Load the model with error handling for different transformers versions
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                **model_kwargs
+            )
+        except (NameError, AttributeError) as e:
+            if "init_empty_weights" in str(e):
+                print("Encountered init_empty_weights error. Trying alternative loading method...")
+                # Try loading with CPU first then moving if needed
+                cpu_kwargs = model_kwargs.copy()
+                cpu_kwargs["device_map"] = None  # Don't use device_map
+                if "load_in_8bit" in cpu_kwargs:
+                    del cpu_kwargs["load_in_8bit"]  # Remove quantization that might cause issues
+                if "quantization_config" in cpu_kwargs:
+                    del cpu_kwargs["quantization_config"]
+                
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    **cpu_kwargs
+                )
+                
+                # Now move to the right device if needed
+                if device_map != "cpu" and torch.cuda.is_available():
+                    model = model.to("cuda")
+            else:
+                raise e
         
         # Print model and tokenizer info
         print(f"Model type: {type(model).__name__}")
