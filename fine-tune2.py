@@ -1,5 +1,5 @@
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, Trainer, TrainingArguments
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, DatasetDict
 
 def fine_tune_model(model_name, dataset_path, output_dir, epochs=3, batch_size=8, learning_rate=5e-5):
     """
@@ -18,7 +18,19 @@ def fine_tune_model(model_name, dataset_path, output_dir, epochs=3, batch_size=8
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Load the dataset
-    dataset = load_dataset('json', data_files=dataset_path)
+    raw_dataset = load_dataset('json', data_files=dataset_path)
+    
+    # Create train/validation split if not already split
+    if 'train' not in raw_dataset:
+        # The dataset is a flat JSON array, so it will be in the 'train' split by default
+        # Let's split it into train and validation
+        train_test_split = raw_dataset['train'].train_test_split(test_size=0.1)
+        dataset = DatasetDict({
+            'train': train_test_split['train'],
+            'validation': train_test_split['test']
+        })
+    else:
+        dataset = raw_dataset
 
     # Tokenize the dataset
     def preprocess_function(examples):
@@ -66,9 +78,9 @@ def fine_tune_model(model_name, dataset_path, output_dir, epochs=3, batch_size=8
 # Example usage
 if __name__ == "__main__":
     fine_tune_model(
-        model_name="t5-small",  # Replace with "phi-3-mini-128k-instruct" or another model
+        model_name="phi-3-mini-128k-instruct",  # Replace with "phi-3-mini-128k-instruct" or another model
         dataset_path="fine_tuning_dataset.json",
-        output_dir="output/plsql-to-linq-finetuned",
+        output_dir="model-tuned/plsql-to-linq-finetuned",
         epochs=3,
         batch_size=8,
         learning_rate=5e-5
