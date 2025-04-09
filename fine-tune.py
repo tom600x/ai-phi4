@@ -48,17 +48,19 @@ def validate_dataset(dataset_path):
         print(f"Error validating dataset: {str(e)}")
         return False
 
-def fine_tune_model(model_name, dataset_path, output_dir, epochs=3, batch_size=8, learning_rate=5e-5):
+def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8, learning_rate=5e-5, use_local_model=True):
     """
     Fine-tune a Hugging Face model with a custom dataset.
 
     Args:
-        model_name (str): Name of the pre-trained model (e.g., "phi-4", "phi-3-mini-128k-instruct").
+        model_path (str): Path to the pre-trained model on disk or model name on HF Hub
+                         (e.g., "path/to/local/model" or "phi-3-mini-128k-instruct").
         dataset_path (str): Path to the dataset file (e.g., JSON, CSV).
         output_dir (str): Directory to save the fine-tuned model.
         epochs (int): Number of training epochs.
         batch_size (int): Training batch size.
         learning_rate (float): Learning rate for training.
+        use_local_model (bool): Whether to load the model from a local path (True) or HF Hub (False).
     """
     # Validate the dataset first
     if not validate_dataset(dataset_path):
@@ -66,9 +68,10 @@ def fine_tune_model(model_name, dataset_path, output_dir, epochs=3, batch_size=8
         return
         
     # Load the pre-trained model and tokenizer
-    print(f"Loading model {model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    print(f"Loading model from {'local path' if use_local_model else 'Hugging Face'}: {model_path}...")
+    # If use_local_model is True, load from a local path, otherwise from HF Hub
+    model = AutoModelForCausalLM.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Load the dataset
     print(f"Loading dataset from {dataset_path}...")
@@ -155,10 +158,11 @@ def fine_tune_model(model_name, dataset_path, output_dir, epochs=3, batch_size=8
 # Example usage
 if __name__ == "__main__":
     fine_tune_model(
-        model_name="phi-3-mini-128k-instruct",  # Replace with "phi-4" or other model as needed
-        dataset_path="fine_tuning_dataset.json",  # Update with the correct path
-        output_dir="output/phi-3-tuned",
+        model_path="/home/TomAdmin/phi-3-mini-128k-instruct",  # Local model path
+        dataset_path="/home/TomAdmin/ai-phi4/fine_tuning_dataset.json",
+        output_dir="/home/TomAdmin/output-model/phi-3-tuned",
         epochs=3,
         batch_size=8,
-        learning_rate=5e-5
+        learning_rate=5e-5,
+        use_local_model=True  # Set to True to use a local model path
     )
