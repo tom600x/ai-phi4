@@ -180,8 +180,8 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
         logging_dir=f'{output_dir}/logs',
         logging_steps=500,
    #     evaluation_strategy="steps",
-  #      eval_steps=500,
-        load_best_model_at_end=True,
+        eval_steps=500,
+        load_best_model_at_end=True
     )
 
     # Initialize the Trainer
