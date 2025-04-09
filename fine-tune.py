@@ -33,16 +33,16 @@ def validate_dataset(dataset_path):
                     return False
                 
                 # Check for input/output fields (typical for instruction tuning datasets)
-                if 'input' in data[0] and 'output' in data[0]:
+                if all(isinstance(item, dict) and 'input' in item and 'output' in item for item in data):
                     print("Found dataset with input/output pairs format.")
                     return True
                 # Check for text field (typical for general language model datasets)
-                elif 'text' in data[0]:
+                elif all(isinstance(item, dict) and 'text' in item for item in data):
                     print("Found dataset with text field format.")
                     return True
                 else:
                     print(f"Error: Dataset must contain records with either 'text' or 'input'/'output' fields.")
-                    print(f"Found structure: {list(data[0].keys())}")
+                    print(f"Found structure: {list(data[0].keys()) if data else 'empty list'}")
                     return False
             elif isinstance(data, dict):
                 if 'train' not in data:
@@ -51,11 +51,16 @@ def validate_dataset(dataset_path):
                 if not data['train']:
                     print(f"Error: Dataset's train split is empty.")
                     return False
-                if ('input' in data['train'][0] and 'output' in data['train'][0]) or 'text' in data['train'][0]:
-                    return True
-                else:
-                    print(f"Error: Dataset's train records must contain either 'text' or 'input'/'output' fields.")
-                    return False
+                
+                # Check structure of train records
+                train_records = data['train']
+                if isinstance(train_records, list) and train_records:
+                    first_record = train_records[0]
+                    if isinstance(first_record, dict) and ('input' in first_record and 'output' in first_record) or 'text' in first_record:
+                        return True
+                
+                print(f"Error: Dataset's train records must contain either 'text' or 'input'/'output' fields.")
+                return False
         
         return True
     except json.JSONDecodeError:
@@ -89,6 +94,10 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     # If use_local_model is True, load from a local path, otherwise from HF Hub
     model = AutoModelForCausalLM.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    
+    # Ensure the tokenizer has padding token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Load the dataset
     print(f"Loading dataset from {dataset_path}...")
@@ -111,11 +120,33 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     
     print("Dataset structure:", {k: len(v) for k, v in dataset.items()})
     
-    # Verify dataset has text field and print sample
+    # Check the dataset format - if input/output pairs, convert to text
+    first_example = dataset['train'][0]
+    if 'text' not in first_example and 'input' in first_example and 'output' in first_example:
+        print("Converting input/output format to text format...")
+        
+        # Function to combine input and output into a single text field
+        def convert_to_text_format(examples):
+            texts = []
+            for i, o in zip(examples['input'], examples['output']):
+                # Format specifically for PL/SQL to LINQ conversion
+                texts.append(f"<|user|>\n{i}\n<|assistant|>\n{o}\n")
+            return {'text': texts}
+        
+        # Apply the conversion
+        for split in dataset:
+            dataset[split] = dataset[split].map(
+                convert_to_text_format,
+                batched=True,
+                remove_columns=['input', 'output'],
+                desc=f"Converting {split} split"
+            )
+        
+        print("Dataset converted to text format.")
+    
+    # Verify dataset has text field now and print sample
     if 'text' not in dataset['train'][0]:
-        print(f"Warning: Dataset doesn't contain 'text' field. Found fields: {list(dataset['train'][0].keys())}")
-        print("Please ensure your dataset has the required format. First record sample:")
-        print(dataset['train'][0])
+        print(f"Error: Could not process dataset format. Found fields: {list(dataset['train'][0].keys())}")
         return
     
     print("Sample data point:", dataset['train'][0]['text'][:100] + "...")
