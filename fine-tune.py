@@ -194,10 +194,8 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
         save_steps=10_000,
         save_total_limit=2,
         logging_dir=f'{output_dir}/logs',
-        logging_steps=500,
-        evaluation_strategy="steps",  # Correct parameter name for Transformers 4.51.0
-        eval_steps=500,
-        load_best_model_at_end=True,
+        logging_steps=500
+        # Removed all evaluation-related parameters
     )
 
     # Initialize the Trainer
