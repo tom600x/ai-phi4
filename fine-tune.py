@@ -102,7 +102,23 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     # Load the dataset
     print(f"Loading dataset from {dataset_path}...")
     if dataset_path.endswith('.json'):
-        dataset = load_dataset('json', data_files=dataset_path)
+        try:
+            # Try the standard method first
+            dataset = load_dataset('json', data_files=dataset_path)
+        except Exception as e:
+            print(f"Standard JSON loading failed: {str(e)}. Trying manual load...")
+            # Fallback to manual loading
+            with open(dataset_path, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+            
+            # Check if it's a plain list or has a train/test structure
+            if isinstance(json_data, list):
+                # Convert the list to a Dataset object
+                dataset = {'train': Dataset.from_dict({'input': [item['input'] for item in json_data], 
+                                                     'output': [item['output'] for item in json_data]})}
+            else:
+                print(f"Error: Unsupported JSON structure: {type(json_data)}")
+                return
     elif dataset_path.endswith('.csv'):
         dataset = load_dataset('csv', data_files=dataset_path)
     else:
@@ -179,9 +195,9 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
         save_total_limit=2,
         logging_dir=f'{output_dir}/logs',
         logging_steps=500,
-   #     evaluation_strategy="steps",
+        evaluation_strategy="steps",  # Correct parameter name for Transformers 4.51.0
         eval_steps=500,
-        load_best_model_at_end=True
+        load_best_model_at_end=True,
     )
 
     # Initialize the Trainer
