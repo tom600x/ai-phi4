@@ -205,14 +205,21 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=1
     # Create a smaller max_length to reduce memory requirements
     max_length = min(512, tokenizer.model_max_length)  # Limit to 512 tokens max
     
-    # Tokenize the dataset with the smaller max_length
+    # Tokenize the dataset with the smaller max_length and prepare labels for causal language modeling
     def tokenize_function(examples):
-        return tokenizer(
+        # Tokenize the text
+        tokenized = tokenizer(
             examples['text'], 
             truncation=True, 
             padding='max_length', 
-            max_length=max_length
+            max_length=max_length,
+            return_tensors=None  # Return as python lists
         )
+        
+        # Set up labels for causal language modeling (same as input_ids)
+        tokenized["labels"] = tokenized["input_ids"].copy()
+        
+        return tokenized
     
     print("Tokenizing dataset...")
     tokenized_dataset = {}
