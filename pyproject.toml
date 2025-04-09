@@ -1,5 +1,0 @@
-[project]
-name = "test_phi4"
-dependencies = [
-    "torch" 
-]
