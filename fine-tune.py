@@ -28,16 +28,33 @@ def validate_dataset(dataset_path):
                 
             # Check if it's a list of records or has a specific structure
             if isinstance(data, list):
-                if not data or 'text' not in data[0]:
-                    print(f"Error: Dataset must contain records with a 'text' field.")
-                    print(f"Found structure: {list(data[0].keys()) if data else 'empty list'}")
+                if not data:
+                    print("Error: Dataset is empty.")
+                    return False
+                
+                # Check for input/output fields (typical for instruction tuning datasets)
+                if 'input' in data[0] and 'output' in data[0]:
+                    print("Found dataset with input/output pairs format.")
+                    return True
+                # Check for text field (typical for general language model datasets)
+                elif 'text' in data[0]:
+                    print("Found dataset with text field format.")
+                    return True
+                else:
+                    print(f"Error: Dataset must contain records with either 'text' or 'input'/'output' fields.")
+                    print(f"Found structure: {list(data[0].keys())}")
                     return False
             elif isinstance(data, dict):
                 if 'train' not in data:
                     print(f"Error: Dataset in dict format should have a 'train' key.")
                     return False
-                if not data['train'] or 'text' not in data['train'][0]:
-                    print(f"Error: Dataset's train split must contain records with a 'text' field.")
+                if not data['train']:
+                    print(f"Error: Dataset's train split is empty.")
+                    return False
+                if ('input' in data['train'][0] and 'output' in data['train'][0]) or 'text' in data['train'][0]:
+                    return True
+                else:
+                    print(f"Error: Dataset's train records must contain either 'text' or 'input'/'output' fields.")
                     return False
         
         return True
