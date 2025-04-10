@@ -70,16 +70,16 @@ def validate_dataset(dataset_path):
         print(f"Error validating dataset: {str(e)}")
         return False
 
-def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8, learning_rate=5e-5, use_local_model=True):
+def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=1, learning_rate=5e-5, use_local_model=True):
     """
-    Fine-tune a Hugging Face model with a custom dataset - optimized for high-core CPU machine with large RAM.
+    Fine-tune a Hugging Face model with a custom dataset with aggressive memory optimizations.
 
     Args:
         model_path (str): Path to the pre-trained model on disk or model name on HF Hub
         dataset_path (str): Path to the dataset file (e.g., JSON, CSV).
         output_dir (str): Directory to save the fine-tuned model.
         epochs (int): Number of training epochs.
-        batch_size (int): Training batch size (increased for high-memory machine).
+        batch_size (int): Training batch size (default reduced to 1).
         learning_rate (float): Learning rate for training.
         use_local_model (bool): Whether to load the model from a local path (True) or HF Hub (False).
     """
@@ -92,29 +92,45 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     import gc
     import torch
     import os
-    import psutil
     
     # Clear memory before loading model
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
-    # Get system memory info for logging
-    memory_info = psutil.virtual_memory()
-    print(f"System memory: {memory_info.total / (1024**3):.1f}GB total, {memory_info.available / (1024**3):.1f}GB available")
-    print(f"CPU count: {os.cpu_count()} cores")
+    # Set up memory-saving environment variables
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
     
-    # Force CPU usage for the model (no GPU)
+    # Force CPU offloading for parts of the model if needed
     print(f"Loading model from {'local path' if use_local_model else 'Hugging Face'}: {model_path}...")
     
-    # CPU-optimized loading for high-memory machine
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        low_cpu_mem_usage=True,
-        device_map="cpu",  # Explicitly use CPU
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # Try to load with 8-bit quantization if available
+    try:
+        from transformers import BitsAndBytesConfig
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=quantization_config,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,  # Use half precision
+            max_memory={0: "8GiB"}  # Limit GPU memory usage
+        )
+        print("Loaded model with 8-bit quantization.")
+    except (ImportError, ValueError) as e:
+        print(f"8-bit quantization not available: {str(e)}. Falling back to standard loading with memory optimization.")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,  # Use half precision
+        )
     
-    # Ensure the tokenizer has padding token
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
@@ -186,10 +202,10 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     
     print("Sample data point:", dataset['train'][0]['text'][:100] + "...")
     
-    # Create a larger max_length to take advantage of abundant RAM
-    max_length = min(2048, tokenizer.model_max_length)  # Allow longer sequences for high-memory machine
+    # Create a smaller max_length to reduce memory requirements
+    max_length = min(512, tokenizer.model_max_length)  # Limit to 512 tokens max
     
-    # Tokenize the dataset with larger max_length and prepare labels for causal language modeling
+    # Tokenize the dataset with the smaller max_length and prepare labels for causal language modeling
     def tokenize_function(examples):
         # Tokenize the text
         tokenized = tokenizer(
@@ -214,27 +230,26 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
             desc=f"Tokenizing {split} split"
         )
     
-    # Define training arguments optimized for high-core CPU with large memory
+    # Define training arguments with aggressive memory optimization
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,  # Increased to 8 for high-memory machine
-        per_device_eval_batch_size=batch_size,
+        per_device_train_batch_size=batch_size,  # Set to 1
+        per_device_eval_batch_size=batch_size,   # Set to 1
         learning_rate=learning_rate,
-        save_steps=500,
-        save_total_limit=3,  # Can keep more checkpoints with high memory
+        save_steps=10_000,
+        save_total_limit=1,  # Keep only 1 checkpoint
         logging_dir=f'{output_dir}/logs',
-        logging_steps=50,
-        # CPU optimization parameters
-        gradient_accumulation_steps=4,  # Reduced for higher batch size
-        fp16=False,  # Disable mixed precision for CPU
-        bf16=False,  # Disable bfloat16 for CPU
+        logging_steps=100,
+        # Memory optimization parameters
+        gradient_accumulation_steps=16,  # Accumulate gradients over more steps
+        fp16=True,                       # Use mixed precision training
         optim="adamw_torch",
         ddp_find_unused_parameters=False,
-        dataloader_num_workers=min(16, os.cpu_count() // 4),  # Use 1/4 of available CPUs for data loading
+        dataloader_num_workers=0,        # No parallel loading
         group_by_length=True,
         weight_decay=0.01,
-        no_cuda=True,  # Force no CUDA
+        no_cuda=not torch.cuda.is_available(),  # Use CPU if no GPU
     )
 
     # Initialize the Trainer
@@ -250,6 +265,8 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     
     # More aggressive memory cleanup
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     trainer.train()
 
@@ -267,7 +284,7 @@ if __name__ == "__main__":
         dataset_path="/home/TomAdmin/ai-phi4/fine_tuning_dataset.json",
         output_dir="/home/TomAdmin/output-model/phi-3-tuned",
         epochs=3,
-        batch_size=8,
+        batch_size=1,
         learning_rate=5e-5,
         use_local_model=True  # Set to True to use a local model path
     )
