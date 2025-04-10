@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Fine-tuning script optimized for Phi-4 using high-performance hardware
+# Fine-tuning script optimized for Phi-4 using high-performance hardware with better memory management
 # Usage: python fine-tune-phi4.py
 
 import json
@@ -21,10 +21,10 @@ from transformers import (
 from datasets import Dataset, load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-# Configure environment for optimal performance
-os.environ["TOKENIZERS_PARALLELISM"] = "true"  # Enable parallel tokenization
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # Ensure consistent GPU ordering
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"  # Optimize CUDA memory allocation
+# Configure environment for optimal performance and memory management
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
 
 def print_system_info():
     """Print system information including GPU, CPU and memory."""
@@ -215,17 +215,18 @@ def fine_tune_phi4(
     output_dir: str, 
     use_lora: bool = True,
     epochs: int = 3, 
-    batch_size: int = 4, 
-    gradient_accumulation_steps: int = 4,
+    batch_size: int = 2,  # Reduced default batch size
+    gradient_accumulation_steps: int = 8,  # Increased gradient accumulation steps
     learning_rate: float = 2e-5,
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
-    max_length: int = 2048,
-    use_8bit: bool = False,
+    max_length: int = 1024,  # Reduced default max length
+    use_8bit: bool = True,   # Default to 8-bit quantization
+    offload_modules: bool = False,
 ):
     """
-    Fine-tune Microsoft Phi-4 model with a custom dataset.
+    Fine-tune Microsoft Phi-4 model with a custom dataset with improved memory management.
 
     Args:
         model_path: Path or name of the Phi-4 model
@@ -241,6 +242,7 @@ def fine_tune_phi4(
         lora_dropout: LoRA dropout probability
         max_length: Maximum sequence length
         use_8bit: Whether to use 8-bit quantization
+        offload_modules: Whether to offload model modules to CPU
     """
     print_system_info()
     
@@ -272,6 +274,29 @@ def fine_tune_phi4(
         else:
             tokenizer.pad_token = "</s>"
     
+    # Configure memory-efficient loading
+    device_map = "auto"
+    if offload_modules:
+        device_map = {
+            "transformer.word_embeddings": 0,
+            "transformer.word_embeddings_layernorm": 0,
+            "lm_head": 0, 
+            "transformer.h.0": 0,
+            "transformer.h.1": 0,
+            "transformer.h.2": 0,
+            "transformer.h.3": 0,
+            "transformer.h.4": "cpu",
+            "transformer.h.5": "cpu",
+            "transformer.h.6": "cpu",
+            "transformer.h.7": "cpu",
+            "transformer.h.8": 0,
+            "transformer.h.9": 0,
+            "transformer.h.10": 0,
+            "transformer.h.11": 0,
+            "transformer.ln_f": 0,
+        }
+        print("Using CPU offloading for some model layers")
+    
     # Configure quantization if requested
     quantization_config = None
     if use_8bit:
@@ -282,13 +307,15 @@ def fine_tune_phi4(
             llm_int8_has_fp16_weight=True
         )
 
-    # Load model
+    # Load model with memory optimization
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         quantization_config=quantization_config,
         torch_dtype=compute_dtype,
         trust_remote_code=True,
-        device_map="auto"  # Automatically determine optimal device mapping
+        device_map=device_map,
+        low_cpu_mem_usage=True,
+        max_memory={0: "20GiB", "cpu": "32GiB"}  # Set memory limits for devices
     )
     
     # Set up LoRA if requested
@@ -312,6 +339,11 @@ def fine_tune_phi4(
     # Load dataset
     dataset = load_phi4_dataset(dataset_path)
     
+    # Free memory after loading dataset
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Tokenize dataset
     tokenized_dataset = tokenize_phi4_dataset(dataset, tokenizer, max_length=max_length)
     
@@ -321,17 +353,22 @@ def fine_tune_phi4(
         mlm=False  # We want causal language modeling, not masked
     )
     
+    # Free memory after tokenization
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Determine effective batch size
     num_gpus = max(1, torch.cuda.device_count())
     effective_batch_size = batch_size * gradient_accumulation_steps * num_gpus
     print(f"Effective batch size: {effective_batch_size} (batch_size={batch_size} × gradient_accumulation={gradient_accumulation_steps} × num_gpus={num_gpus})")
     
-    # Configure training arguments
+    # Configure training arguments with even more memory-efficient settings
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
+        per_device_eval_batch_size=max(1, batch_size // 2),  # Smaller eval batch size
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -345,21 +382,30 @@ def fine_tune_phi4(
         logging_strategy="steps",
         logging_steps=10,
         save_strategy="epoch",
-        save_total_limit=3,
-        evaluation_strategy="epoch",
+        save_total_limit=2,  # Only keep 2 checkpoints to save space
+        # Fix: Change evaluation_strategy to "steps" to be compatible with eval_steps
+        evaluation_strategy="steps",
         eval_steps=500,
-        fp16=not use_8bit and compute_dtype == torch.float16,  # Use fp16 only if not using 8-bit and not using bfloat16
-        bf16=not use_8bit and compute_dtype == torch.bfloat16,  # Use bf16 only if not using 8-bit and using bfloat16
+        fp16=not use_8bit and compute_dtype == torch.float16,
+        bf16=not use_8bit and compute_dtype == torch.bfloat16,
         report_to="tensorboard",
         run_name=f"phi4_finetune_{os.path.basename(output_dir)}",
-        # High performance settings
-        deepspeed=None,  # Optional: Use DeepSpeed for even better performance (requires separate config)
-        dataloader_num_workers=os.cpu_count() // 2,  # Use half of available CPUs for data loading
-        group_by_length=True,  # Group sequences of similar lengths to minimize padding
-        gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
-        ddp_find_unused_parameters=False,  # More efficient distributed training
-        torch_compile=False,  # Can be enabled for PyTorch 2.0+ for more speed
-        optim="adamw_torch_fused"  # Use fused optimizer for better performance
+        # Memory-optimized settings
+        deepspeed=None,
+        dataloader_num_workers=min(4, os.cpu_count() // 2),  # Limit workers to reduce memory
+        group_by_length=True,
+        gradient_checkpointing=True,
+        ddp_find_unused_parameters=False,
+        torch_compile=False,
+        optim="adamw_torch_fused",
+        # Additional memory optimizations
+        greater_is_better=False,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        hub_model_id=None,  # Don't push to hub during training
+        hub_strategy="every_save",
+        remove_unused_columns=True,
+        no_cuda=False,  # Use CUDA if available
     )
     
     # Initialize trainer
@@ -396,20 +442,21 @@ def fine_tune_phi4(
     print(f"Model fine-tuning complete! Model saved to {output_dir}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune Microsoft Phi-4 model")
+    parser = argparse.ArgumentParser(description="Fine-tune Microsoft Phi-4 model with enhanced memory management")
     parser.add_argument("--model_path", type=str, default="microsoft/Phi-4", help="Path or name of the Phi-4 model")
     parser.add_argument("--dataset_path", type=str, default="phi4_fine_tuning_dataset.json", help="Path to the JSONL dataset file")
     parser.add_argument("--output_dir", type=str, default="output/phi4-finetuned", help="Directory to save the fine-tuned model")
     parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for memory-efficient fine-tuning")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, help="Training batch size per device")
-    parser.add_argument("--gradient_accumulation", type=int, default=4, help="Number of steps to accumulate gradients")
+    parser.add_argument("--batch_size", type=int, default=2, help="Training batch size per device")
+    parser.add_argument("--gradient_accumulation", type=int, default=8, help="Number of steps to accumulate gradients")
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate for training")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA attention dimension")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha parameter")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout probability")
-    parser.add_argument("--max_length", type=int, default=2048, help="Maximum sequence length")
-    parser.add_argument("--use_8bit", action="store_true", help="Use 8-bit quantization")
+    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
+    parser.add_argument("--use_8bit", action="store_true", default=True, help="Use 8-bit quantization")
+    parser.add_argument("--offload_modules", action="store_true", help="Offload some model modules to CPU")
     args = parser.parse_args()
     
     fine_tune_phi4(
@@ -425,5 +472,6 @@ if __name__ == "__main__":
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         max_length=args.max_length,
-        use_8bit=args.use_8bit
+        use_8bit=args.use_8bit,
+        offload_modules=args.offload_modules
     )
