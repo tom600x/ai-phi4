@@ -1,9 +1,12 @@
 #pip install transformers datasets torch
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, concatenate_datasets
 import json
 import os
+
+# Disable tokenizer parallelism
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def validate_dataset(dataset_path):
     """
@@ -70,16 +73,16 @@ def validate_dataset(dataset_path):
         print(f"Error validating dataset: {str(e)}")
         return False
 
-def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8, learning_rate=5e-5, use_local_model=True):
+def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=1, learning_rate=5e-5, use_local_model=True):
     """
-    Fine-tune a Hugging Face model with a custom dataset - optimized for high-core CPU machine with large RAM.
+    Fine-tune a Hugging Face model with a custom dataset - ultra memory-efficient version.
 
     Args:
         model_path (str): Path to the pre-trained model on disk or model name on HF Hub
         dataset_path (str): Path to the dataset file (e.g., JSON, CSV).
         output_dir (str): Directory to save the fine-tuned model.
         epochs (int): Number of training epochs.
-        batch_size (int): Training batch size (increased for high-memory machine).
+        batch_size (int): Training batch size (reduced to minimum).
         learning_rate (float): Learning rate for training.
         use_local_model (bool): Whether to load the model from a local path (True) or HF Hub (False).
     """
@@ -94,7 +97,7 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     import os
     import psutil
     
-    # Clear memory before loading model
+    # Aggressive memory management - force garbage collection
     gc.collect()
     
     # Get system memory info for logging
@@ -102,16 +105,22 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     print(f"System memory: {memory_info.total / (1024**3):.1f}GB total, {memory_info.available / (1024**3):.1f}GB available")
     print(f"CPU count: {os.cpu_count()} cores")
     
-    # Force CPU usage for the model (no GPU)
+    # Set memory management environment variables
+    os.environ["PYTORCH_CPU_ALLOC_CONF"] = "max_split_size_mb:128"
+    
     print(f"Loading model from {'local path' if use_local_model else 'Hugging Face'}: {model_path}...")
     
-    # CPU-optimized loading for high-memory machine
+    # CPU-optimized loading with extreme memory efficiency
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         low_cpu_mem_usage=True,
-        device_map="cpu",  # Explicitly use CPU
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=torch.float32,  # Use standard precision for better compatibility
+        device_map={"": "cpu"},  # Force CPU for all modules
     )
+    
+    # Free up memory after model loading
+    gc.collect()
+    
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     
     # Ensure the tokenizer has padding token
@@ -155,86 +164,88 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=8
     
     print("Dataset structure:", {k: len(v) for k, v in dataset.items()})
     
-    # Check the dataset format - if input/output pairs, convert to text
-    first_example = dataset['train'][0]
-    if 'text' not in first_example and 'input' in first_example and 'output' in first_example:
-        print("Converting input/output format to text format...")
-        
-        # Function to combine input and output into a single text field
-        def convert_to_text_format(examples):
-            texts = []
-            for i, o in zip(examples['input'], examples['output']):
-                # Format specifically for PL/SQL to LINQ conversion
-                texts.append(f"<|user|>\n{i}\n<|assistant|>\n{o}\n")
-            return {'text': texts}
-        
-        # Apply the conversion
+    # Process the dataset in smaller chunks to save memory
+    print("Processing dataset in smaller chunks to conserve memory...")
+    
+    # Function to process dataset in chunks
+    def process_dataset_in_chunks(dataset, chunk_size=100):
         for split in dataset:
-            dataset[split] = dataset[split].map(
-                convert_to_text_format,
-                batched=True,
-                remove_columns=['input', 'output'],
-                desc=f"Converting {split} split"
-            )
-        
-        print("Dataset converted to text format.")
+            total_samples = len(dataset[split])
+            chunk_datasets = []
+            
+            for i in range(0, total_samples, chunk_size):
+                end_idx = min(i + chunk_size, total_samples)
+                print(f"Processing {split} chunk {i}-{end_idx} of {total_samples}")
+                chunk = dataset[split].select(range(i, end_idx))
+                
+                # Process this chunk
+                if 'text' not in chunk[0] and 'input' in chunk[0] and 'output' in chunk[0]:
+                    chunk = chunk.map(
+                        lambda example: {'text': f"<|user|>\n{example['input']}\n<|assistant|>\n{example['output']}\n"},
+                        remove_columns=['input', 'output']
+                    )
+                
+                # Tokenize the chunk
+                tokenized_chunk = chunk.map(
+                    lambda example: {
+                        **tokenizer(
+                            example['text'],
+                            truncation=True,
+                            padding='max_length',
+                            max_length=max_length,
+                        ),
+                        'labels': tokenizer(
+                            example['text'],
+                            truncation=True,
+                            padding='max_length',
+                            max_length=max_length,
+                        )['input_ids']
+                    },
+                    desc=f"Tokenizing {split} chunk"
+                )
+                
+                chunk_datasets.append(tokenized_chunk)
+                
+                # Force garbage collection after each chunk
+                gc.collect()
+            
+            # Combine all chunks
+            dataset[split] = concatenate_datasets(chunk_datasets)
+            
+        return dataset
     
-    # Verify dataset has text field now and print sample
-    if 'text' not in dataset['train'][0]:
-        print(f"Error: Could not process dataset format. Found fields: {list(dataset['train'][0].keys())}")
-        return
+    # Create a much smaller max_length to reduce memory requirements
+    max_length = min(512, tokenizer.model_max_length)  # Strict limit to 512 tokens for memory efficiency
     
-    print("Sample data point:", dataset['train'][0]['text'][:100] + "...")
+    # Process dataset in chunks
+    tokenized_dataset = process_dataset_in_chunks(dataset, chunk_size=100)
     
-    # Create a larger max_length to take advantage of abundant RAM
-    max_length = min(2048, tokenizer.model_max_length)  # Allow longer sequences for high-memory machine
+    # Force garbage collection before training
+    gc.collect()
     
-    # Tokenize the dataset with larger max_length and prepare labels for causal language modeling
-    def tokenize_function(examples):
-        # Tokenize the text
-        tokenized = tokenizer(
-            examples['text'], 
-            truncation=True, 
-            padding='max_length', 
-            max_length=max_length,
-            return_tensors=None  # Return as python lists
-        )
-        
-        # Set up labels for causal language modeling (same as input_ids)
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        
-        return tokenized
-    
-    print("Tokenizing dataset...")
-    tokenized_dataset = {}
-    for split in dataset:
-        tokenized_dataset[split] = dataset[split].map(
-            tokenize_function, 
-            batched=True, 
-            desc=f"Tokenizing {split} split"
-        )
-    
-    # Define training arguments optimized for high-core CPU with large memory
+    # Define training arguments optimized for extreme memory constraints
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,  # Increased to 8 for high-memory machine
+        per_device_train_batch_size=batch_size,  # Minimum batch size
         per_device_eval_batch_size=batch_size,
         learning_rate=learning_rate,
-        save_steps=500,
-        save_total_limit=3,  # Can keep more checkpoints with high memory
+        save_steps=2_000,
+        save_total_limit=1,  # Keep only 1 checkpoint to save memory
         logging_dir=f'{output_dir}/logs',
-        logging_steps=50,
-        # CPU optimization parameters
-        gradient_accumulation_steps=4,  # Reduced for higher batch size
-        fp16=False,  # Disable mixed precision for CPU
-        bf16=False,  # Disable bfloat16 for CPU
+        logging_steps=100,
+        # Ultra memory-efficient settings
+        gradient_accumulation_steps=16,  # Accumulate gradients over many steps
+        fp16=False,
+        bf16=False,
         optim="adamw_torch",
         ddp_find_unused_parameters=False,
-        dataloader_num_workers=min(16, os.cpu_count() // 4),  # Use 1/4 of available CPUs for data loading
+        dataloader_num_workers=1,  # Minimal parallelism to save memory
         group_by_length=True,
         weight_decay=0.01,
-        no_cuda=True,  # Force no CUDA
+        no_cuda=True,
+        # Do not keep unused elements in memory
+        remove_unused_columns=True,
     )
 
     # Initialize the Trainer
@@ -267,7 +278,7 @@ if __name__ == "__main__":
         dataset_path="/home/TomAdmin/ai-phi4/fine_tuning_dataset.json",
         output_dir="/home/TomAdmin/output-model/phi-3-tuned",
         epochs=3,
-        batch_size=8,
+        batch_size=1,
         learning_rate=5e-5,
         use_local_model=True  # Set to True to use a local model path
     )
