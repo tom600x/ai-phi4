@@ -24,25 +24,41 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 # Configure environment for optimal performance and memory management
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable parallel tokenization to save memory
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-# Set PYTORCH_CUDA_ALLOC_CONF to avoid fragmentation and enable expandable segments
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64,expandable_segments:True"
-
-# Add these to ensure PyTorch releases memory properly
+# Set PYTORCH_CUDA_ALLOC_CONF with more aggressive settings
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32,expandable_segments:True"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
+
+# NEW: Force PyTorch to free GPU memory more aggressively
+os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+
+# Try importing DeepSpeed for more memory-efficient operations
+try:
+    import deepspeed
+    HAS_DEEPSPEED = True
+except ImportError:
+    HAS_DEEPSPEED = False
 
 def free_memory():
     """Aggressively free GPU and CPU memory."""
     gc.collect()
-    torch.cuda.empty_cache()
-    try:
-        # For NVIDIA GPUs, try to reset the GPU memory stats
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.reset_accumulated_memory_stats()
-    except:
-        pass
-    
-    print(f"Memory after cleanup - GPU: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
+        except:
+            pass
+        
+        # NEW: More aggressive memory cleanup
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                # Force clear any tensor caches
+                torch.cuda.empty_cache()
+                
+        print(f"Memory after cleanup - GPU: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated")
+    else:
+        print("No CUDA available for memory cleanup")
 
 def print_system_info():
     """Print system information including GPU, CPU and memory."""
