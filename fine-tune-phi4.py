@@ -385,18 +385,37 @@ def fine_tune_phi4(
         if use_8bit or use_4bit:
             model = prepare_model_for_kbit_training(model)
             
-        # Configure LoRA with more memory-efficient settings
+        # Update target modules based on the actual model structure
+        # From the output: 'layers.*.self_attn.qkv_proj', 'layers.*.self_attn.o_proj', 'layers.*.mlp.gate_up_proj', 'layers.*.mlp.down_proj'
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
-            target_modules=["q_proj", "v_proj"],  # Reduced target modules
+            # Exact module names for Phi-4
+            target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
             lora_dropout=lora_dropout,
             bias="none",
             task_type="CAUSAL_LM"
         )
         
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+        try:
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+        except ValueError as e:
+            print(f"Error with specified target modules: {str(e)}")
+            print("Falling back to automatic target module detection...")
+            # Fallback to automatic target module detection
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                # Let PEFT find the modules automatically
+                target_modules=None,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM"
+            )
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+            print(f"Auto-detected target modules: {model.peft_config['default'].target_modules}")
     
     free_memory()
     
