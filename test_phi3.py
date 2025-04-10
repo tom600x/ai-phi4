@@ -2,8 +2,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Load the model and tokenizer only once at the start
 print("Loading model and tokenizer, please wait...")
-model = AutoModelForCausalLM.from_pretrained("/home/TomAdmin/phi-3-mini-128k-instruct")
-tokenizer = AutoTokenizer.from_pretrained("/home/TomAdmin/phi-3-mini-128k-instruct")
+model = AutoModelForCausalLM.from_pretrained("/home/TomAdmin/output-model/phi-3-tuned")
+tokenizer = AutoTokenizer.from_pretrained("/home/TomAdmin/output-model/phi-3-tuned")
 print("Model loaded successfully!")
 
 def generate_text(prompt):
