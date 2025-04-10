@@ -459,8 +459,6 @@ def fine_tune_phi4(
         save_strategy="steps",
         save_steps=500,
         save_total_limit=1,  # Keep only 1 checkpoint to save space
-        evaluation_strategy="steps",
-        eval_steps=500,
         fp16=not (use_8bit or use_4bit) and compute_dtype == torch.float16,
         bf16=not (use_8bit or use_4bit) and compute_dtype == torch.bfloat16,
         report_to="tensorboard",
@@ -473,10 +471,6 @@ def fine_tune_phi4(
         ddp_find_unused_parameters=False,
         torch_compile=False,
         optim="adamw_torch",  # Use standard optimizer
-        # Additional memory optimizations
-        greater_is_better=False,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
         hub_model_id=None,
         hub_strategy="every_save",
         remove_unused_columns=True,
