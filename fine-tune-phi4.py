@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Fine-tuning script optimized for Phi-4 using high-performance hardware with extreme memory optimization
+# Fine-tuning script optimized for Phi-4 using high-performance hardware with dual-GPU optimization
 # Usage: python fine-tune-phi4.py
 
 import json
@@ -20,24 +20,26 @@ from transformers import (
 )
 from datasets import Dataset, load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel
 
-# Configure environment for optimal performance and memory management
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable parallel tokenization to save memory
+# Configure environment for dual-GPU high-performance setup
+os.environ["TOKENIZERS_PARALLELISM"] = "true"  # Enable parallel tokenization for 70 vCPUs
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-# Set PYTORCH_CUDA_ALLOC_CONF with more aggressive settings
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32,expandable_segments:True"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
+# Optimize memory allocation for two 19GB GPUs
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+# Set threads for multi-CPU efficiency
+os.environ["OMP_NUM_THREADS"] = "35"  # Half of available vCPUs for better threading balance
 
-# NEW: Force PyTorch to free GPU memory more aggressively
-os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
-
-# Try importing DeepSpeed for more memory-efficient operations
+# Try importing DeepSpeed for multi-GPU optimization
 try:
     import deepspeed
     HAS_DEEPSPEED = True
+    print("DeepSpeed is available for advanced multi-GPU optimization")
 except ImportError:
     HAS_DEEPSPEED = False
+    print("DeepSpeed not found. Consider installing it with 'pip install deepspeed' for better multi-GPU performance")
 
 def free_memory():
     """Aggressively free GPU and CPU memory."""
@@ -50,13 +52,13 @@ def free_memory():
         except:
             pass
         
-        # NEW: More aggressive memory cleanup
         for i in range(torch.cuda.device_count()):
             with torch.cuda.device(i):
-                # Force clear any tensor caches
                 torch.cuda.empty_cache()
                 
-        print(f"Memory after cleanup - GPU: {torch.cuda.memory_allocated() / 1024**3:.2f} GB allocated")
+        print(f"Memory after cleanup - " + 
+              " ".join([f"GPU {i}: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB allocated" 
+                       for i in range(torch.cuda.device_count())]))
     else:
         print("No CUDA available for memory cleanup")
 
@@ -147,14 +149,7 @@ def validate_jsonl_dataset(dataset_path: str) -> bool:
 
 def load_phi4_dataset(dataset_path: str, max_samples=None):
     """
-    Load and prepare the dataset for Phi-4 fine-tuning with memory optimizations.
-    
-    Args:
-        dataset_path: Path to the dataset file
-        max_samples: Maximum number of samples to load (for memory constraints)
-    
-    Returns:
-        Processed dataset ready for training
+    Load and prepare the dataset for Phi-4 fine-tuning with multi-CPU optimization.
     """
     print(f"Loading dataset from {dataset_path}...")
     
@@ -204,62 +199,47 @@ def load_phi4_dataset(dataset_path: str, max_samples=None):
     print(f"Dataset loaded and processed: {len(result_dataset['train'])} training examples, {len(result_dataset['validation'])} validation examples")
     return result_dataset
 
-def tokenize_phi4_dataset(dataset, tokenizer, max_length=512):
+def tokenize_phi4_dataset(dataset, tokenizer, max_length=1024, num_workers=35):
     """
-    Tokenize the dataset using the provided tokenizer with memory optimizations.
+    Tokenize the dataset using the provided tokenizer with multi-CPU optimization.
     
     Args:
         dataset: The dataset to tokenize
         tokenizer: The tokenizer to use
         max_length: Maximum sequence length
+        num_workers: Number of CPU workers for tokenization (set to half of available vCPUs)
     
     Returns:
         Tokenized dataset
     """
-    print(f"Tokenizing dataset with max_length={max_length}...")
+    print(f"Tokenizing dataset with max_length={max_length} using {num_workers} workers...")
     
     def tokenize_function(examples):
         texts = examples["text"]
         
-        # Process in smaller chunks to save memory
-        all_tokenized = {"input_ids": [], "attention_mask": [], "labels": []}
-        chunk_size = 1  # Process one example at a time to minimize memory usage
+        # For multi-GPU setup, process in larger batches with multi-CPU
+        tokenized = tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt"
+        )
         
-        for i in range(0, len(texts), chunk_size):
-            end_idx = min(i + chunk_size, len(texts))
-            chunk = texts[i:end_idx]
-            
-            # Tokenize this small chunk
-            tokenized = tokenizer(
-                chunk,
-                padding="max_length",
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt"
-            )
-            
-            # Copy the tensors to lists to avoid keeping references to CUDA tensors
-            for key in tokenized:
-                all_tokenized.setdefault(key, []).extend(tokenized[key].cpu().tolist())
-            
-            # Set up labels equal to input_ids for causal language modeling
-            all_tokenized.setdefault("labels", []).extend(tokenized["input_ids"].cpu().tolist())
-            
-            # Force cleanup after each chunk
-            del tokenized
-            free_memory()
-            
-        return all_tokenized
+        # Set up labels equal to input_ids for causal language modeling
+        tokenized["labels"] = tokenized["input_ids"].clone()
+        
+        return tokenized
     
-    # Apply tokenization to each split, with limited parallelism
+    # Apply tokenization to each split with optimized multi-processing
     tokenized_dataset = {}
     for split in dataset:
         print(f"Tokenizing {split} split...")
         tokenized_dataset[split] = dataset[split].map(
             tokenize_function,
             batched=True,
-            batch_size=4,  # Small batch size to reduce memory usage
-            num_proc=1,    # Don't use multiple processes to save memory
+            batch_size=64,  # Increased batch size for faster processing
+            num_proc=num_workers,  # Use multiple CPU cores
             remove_columns=["text"],
             desc=f"Tokenizing {split} dataset"
         )
@@ -268,26 +248,51 @@ def tokenize_phi4_dataset(dataset, tokenizer, max_length=512):
     print("Dataset tokenized successfully.")
     return tokenized_dataset
 
+# Create a function to generate a DeepSpeed config optimized for our setup
+def get_deepspeed_config(train_batch_size):
+    """
+    Generate a DeepSpeed configuration optimized for 2x19GB GPUs.
+    """
+    return {
+        "fp16": {
+            "enabled": True
+        },
+        "zero_optimization": {
+            "stage": 2,  # Stage 2 for balancing memory and speed
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "contiguous_gradients": True,
+            "overlap_comm": True
+        },
+        "gradient_accumulation_steps": 1,  # We handle this in training args
+        "train_micro_batch_size_per_gpu": train_batch_size,
+        "gradient_clipping": 1.0,
+        "steps_per_print": 10,
+    }
+
 def fine_tune_phi4(
     model_path: str, 
     dataset_path: str, 
     output_dir: str, 
     use_lora: bool = True,
     epochs: int = 3, 
-    batch_size: int = 1,     # Reduced to 1
-    gradient_accumulation_steps: int = 16,  # Increased to 16
+    batch_size: int = 4,     # Increased for dual-GPU
+    gradient_accumulation_steps: int = 4,  # Optimized for dual-GPU
     learning_rate: float = 2e-5,
-    lora_r: int = 8,         # Reduced to 8
-    lora_alpha: int = 16,    # Reduced to 16
-    lora_dropout: float = 0.1,
-    max_length: int = 512,   # Reduced to 512
+    lora_r: int = 16,        # Increased for higher capacity
+    lora_alpha: int = 32,    # Increased for better training dynamics
+    lora_dropout: float = 0.05,
+    max_length: int = 1024,  # Increased for larger context windows
     use_8bit: bool = True,   
-    use_4bit: bool = False,  # New option for 4-bit quantization
-    offload_modules: bool = True,  # Default to offload
-    max_samples: int = None  # Limit number of training samples
+    use_4bit: bool = False,
+    use_deepspeed: bool = True,
+    offload_modules: bool = False,  # Less need with dual GPUs
+    max_samples: int = None
 ):
     """
-    Fine-tune Microsoft Phi-4 model with extreme memory optimization.
+    Fine-tune Microsoft Phi-4 model optimized for dual-GPU setup with 19GB each.
     """
     print_system_info()
     
@@ -319,31 +324,18 @@ def fine_tune_phi4(
         else:
             tokenizer.pad_token = "</s>"
     
-    # Configure memory-efficient loading
+    # Configure model distribution across both GPUs
     device_map = "auto"
-    if offload_modules:
-        # Offload more layers to CPU
-        device_map = {
-            "model.embed_tokens": 0,
-            "lm_head": 0,
-            "model.norm": 0
-        }
+    if not use_deepspeed:  # If not using DeepSpeed, manually distribute model
+        # Optimal distribution across 2 GPUs
+        device_map = "balanced"  # Let HF auto-balance across the 2 GPUs
         
-        # Offload most transformer blocks to CPU
-        num_layers = 32  # Phi-4 typically has 32 layers
-        for i in range(num_layers):
-            # Keep only a few layers on GPU
-            if i < 4 or i >= num_layers-4:
-                device_map[f"model.layers.{i}"] = 0
-            else:
-                device_map[f"model.layers.{i}"] = "cpu"
-                
-        print("Using aggressive CPU offloading for model layers")
+        print("Using balanced distribution across both GPUs")
     
     # Configure quantization
     quantization_config = None
     if use_4bit:
-        print("Using 4-bit quantization (most memory efficient)")
+        print("Using 4-bit quantization")
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=compute_dtype,
@@ -358,39 +350,47 @@ def fine_tune_phi4(
             llm_int8_has_fp16_weight=True
         )
 
-    # Load model with extreme memory optimization
+    # Load model with dual-GPU optimization
+    model_load_kwargs = {
+        "quantization_config": quantization_config,
+        "torch_dtype": compute_dtype,
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+    
+    # If not using DeepSpeed, set device_map and memory limits
+    if not use_deepspeed:
+        model_load_kwargs.update({
+            "device_map": device_map,
+            "max_memory": {0: "18GiB", 1: "18GiB", "cpu": "70GiB"}  # Balanced memory for both GPUs
+        })
+    
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            quantization_config=quantization_config,
-            torch_dtype=compute_dtype,
-            trust_remote_code=True,
-            device_map=device_map,
-            low_cpu_mem_usage=True,
-            max_memory={0: "18GiB", "cpu": "32GiB"}  # Reduced GPU memory limit
+            **model_load_kwargs
         )
     except Exception as e:
         print(f"Error loading model: {str(e)}")
-        print("Trying with even more aggressive memory settings...")
+        print("Trying with more aggressive memory settings...")
         
         # Try again with more aggressive settings
         if not use_4bit:
             print("Switching to 4-bit quantization")
-            quantization_config = BitsAndBytesConfig(
+            model_load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,  # Force float16
+                bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4"
             )
+            model_load_kwargs["torch_dtype"] = torch.float16
+        
+        if not use_deepspeed:
+            model_load_kwargs["max_memory"] = {0: "16GiB", 1: "16GiB", "cpu": "70GiB"}
             
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            quantization_config=quantization_config,
-            torch_dtype=torch.float16,  # Force float16
-            trust_remote_code=True,
-            device_map="auto",  # Let the library decide mapping
-            low_cpu_mem_usage=True,
-            max_memory={0: "16GiB", "cpu": "32GiB"}  # Further reduce GPU memory
+            **model_load_kwargs
         )
     
     free_memory()
@@ -401,12 +401,10 @@ def fine_tune_phi4(
         if use_8bit or use_4bit:
             model = prepare_model_for_kbit_training(model)
             
-        # Update target modules based on the actual model structure
-        # From the output: 'layers.*.self_attn.qkv_proj', 'layers.*.self_attn.o_proj', 'layers.*.mlp.gate_up_proj', 'layers.*.mlp.down_proj'
+        # Configure LoRA with optimized settings for dual-GPU
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
-            # Exact module names for Phi-4
             target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
             lora_dropout=lora_dropout,
             bias="none",
@@ -423,8 +421,7 @@ def fine_tune_phi4(
             lora_config = LoraConfig(
                 r=lora_r,
                 lora_alpha=lora_alpha,
-                # Let PEFT find the modules automatically
-                target_modules=None,
+                target_modules=None,  # Auto-detect
                 lora_dropout=lora_dropout,
                 bias="none",
                 task_type="CAUSAL_LM"
@@ -435,12 +432,13 @@ def fine_tune_phi4(
     
     free_memory()
     
-    # Load dataset with potentially limited samples
+    # Load dataset with optimized processing for 70 vCPUs
     dataset = load_phi4_dataset(dataset_path, max_samples=max_samples)
     free_memory()
     
-    # Tokenize dataset with memory optimizations
-    tokenized_dataset = tokenize_phi4_dataset(dataset, tokenizer, max_length=max_length)
+    # Tokenize dataset with multi-CPU optimization
+    cpu_workers = min(35, os.cpu_count() // 2)  # Use half of available vCPUs for tokenization
+    tokenized_dataset = tokenize_phi4_dataset(dataset, tokenizer, max_length=max_length, num_workers=cpu_workers)
     free_memory()
     
     # Prepare data collator
@@ -449,17 +447,23 @@ def fine_tune_phi4(
         mlm=False  # We want causal language modeling, not masked
     )
     
-    # Determine effective batch size
-    num_gpus = max(1, torch.cuda.device_count())
+    # Determine effective batch size accounting for 2 GPUs
+    num_gpus = torch.cuda.device_count()
     effective_batch_size = batch_size * gradient_accumulation_steps * num_gpus
     print(f"Effective batch size: {effective_batch_size} (batch_size={batch_size} × gradient_accumulation={gradient_accumulation_steps} × num_gpus={num_gpus})")
     
-    # Configure training arguments with extreme memory-efficient settings
+    # Configure DeepSpeed if available and requested
+    deepspeed_config = None
+    if HAS_DEEPSPEED and use_deepspeed:
+        deepspeed_config = get_deepspeed_config(batch_size)
+        print("Using DeepSpeed configuration for multi-GPU training")
+    
+    # Configure training arguments optimized for dual-GPU setup
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=1,  # Set to minimum
+        per_device_eval_batch_size=batch_size // 2,  # Half training batch size
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -471,29 +475,31 @@ def fine_tune_phi4(
         warmup_ratio=0.1,
         logging_dir=f"{output_dir}/logs",
         logging_strategy="steps",
-        logging_steps=50,
+        logging_steps=10,
         save_strategy="steps",
-        save_steps=500,
-        save_total_limit=1,  # Keep only 1 checkpoint to save space
+        save_steps=200,
+        save_total_limit=3,  # Keep 3 checkpoints with more available memory
         fp16=not (use_8bit or use_4bit) and compute_dtype == torch.float16,
         bf16=not (use_8bit or use_4bit) and compute_dtype == torch.bfloat16,
         report_to="tensorboard",
         run_name=f"phi4_finetune_{os.path.basename(output_dir)}",
-        # Memory-optimized settings
-        deepspeed=None,
-        dataloader_num_workers=0,  # No parallel data loading
-        group_by_length=False,  # Disable grouping to save memory
-        gradient_checkpointing=True,
+        # Multi-GPU settings
+        deepspeed=deepspeed_config,
+        local_rank=-1,  # Auto-detect for distributed training
+        dataloader_num_workers=cpu_workers // 2,  # Optimize data loading for 70 vCPUs
+        group_by_length=True,  # Better for multi-GPU efficiency
+        gradient_checkpointing=True,  # Still useful for memory efficiency
         ddp_find_unused_parameters=False,
-        torch_compile=False,
-        optim="adamw_torch",  # Use standard optimizer
-        hub_model_id=None,
-        hub_strategy="every_save",
+        torch_compile=False,  # Can be enabled for PyTorch 2.0+ if available
+        optim="adamw_torch_fused",  # Use fused optimizer for better performance
+        # Set these if your transformers version supports them
+        # greater_is_better=False,
+        # load_best_model_at_end=True,
+        # metric_for_best_model="eval_loss",
         remove_unused_columns=True,
-        no_cuda=False,
     )
     
-    # Initialize trainer
+    # Initialize trainer with multi-GPU awareness
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -506,18 +512,18 @@ def fine_tune_phi4(
     free_memory()
     
     # Train model
-    print("\n=== Starting Training ===")
+    print("\n=== Starting Training on Multiple GPUs ===")
     
     try:
         trainer.train()
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
-            print("\nERROR: CUDA out of memory. Try the following:")
-            print("1. Reduce batch_size to 1")
-            print("2. Reduce max_length to 256")
-            print("3. Use --use_4bit option for 4-bit quantization")
-            print("4. Use --max_samples to limit the number of training examples")
-            print("5. Try running on a machine with more GPU memory")
+            print("\nERROR: CUDA out of memory. Try reducing batch size or enabling DeepSpeed.")
+            print("For dual 19GB GPUs, recommended settings:")
+            print("1. Use DeepSpeed with Zero stage 2/3")
+            print("2. Use gradient_accumulation_steps=4 with batch_size=4")
+            print("3. Enable 8-bit quantization")
+            print("4. Set max_length to 1024 or lower")
         raise
     
     # Save model
@@ -535,24 +541,29 @@ def fine_tune_phi4(
     print(f"Model fine-tuning complete! Model saved to {output_dir}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune Microsoft Phi-4 model with extreme memory optimization")
+    parser = argparse.ArgumentParser(description="Fine-tune Microsoft Phi-4 model optimized for dual 19GB GPUs")
     parser.add_argument("--model_path", type=str, default="microsoft/Phi-4", help="Path or name of the Phi-4 model")
     parser.add_argument("--dataset_path", type=str, default="phi4_fine_tuning_dataset.json", help="Path to the JSONL dataset file")
     parser.add_argument("--output_dir", type=str, default="output/phi4-finetuned", help="Directory to save the fine-tuned model")
-    parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for memory-efficient fine-tuning")
+    parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for parameter-efficient fine-tuning")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=1, help="Training batch size per device")
-    parser.add_argument("--gradient_accumulation", type=int, default=16, help="Number of steps to accumulate gradients")
+    parser.add_argument("--batch_size", type=int, default=4, help="Training batch size per device")
+    parser.add_argument("--gradient_accumulation", type=int, default=4, help="Number of steps to accumulate gradients")
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate for training")
-    parser.add_argument("--lora_r", type=int, default=8, help="LoRA attention dimension")
-    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha parameter")
-    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout probability")
-    parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length")
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA attention dimension")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha parameter")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout probability")
+    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
     parser.add_argument("--use_8bit", action="store_true", default=True, help="Use 8-bit quantization")
     parser.add_argument("--use_4bit", action="store_true", help="Use 4-bit quantization (overrides 8-bit)")
-    parser.add_argument("--offload_modules", action="store_true", default=True, help="Offload most model modules to CPU")
-    parser.add_argument("--max_samples", type=int, help="Maximum number of samples to use for training (for memory constraints)")
+    parser.add_argument("--use_deepspeed", action="store_true", default=True, help="Use DeepSpeed for multi-GPU optimization")
+    parser.add_argument("--offload_modules", action="store_true", help="Offload model modules to CPU (less needed with dual-GPU)")
+    parser.add_argument("--max_samples", type=int, help="Maximum number of samples to use for training")
     args = parser.parse_args()
+    
+    # For dual-GPU distributed training
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training")
     
     fine_tune_phi4(
         model_path=args.model_path,
@@ -569,6 +580,7 @@ if __name__ == "__main__":
         max_length=args.max_length,
         use_8bit=args.use_8bit,
         use_4bit=args.use_4bit,
+        use_deepspeed=args.use_deepspeed,
         offload_modules=args.offload_modules,
         max_samples=args.max_samples
     )
