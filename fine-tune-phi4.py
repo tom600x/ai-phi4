@@ -252,10 +252,11 @@ def tokenize_phi4_dataset(dataset, tokenizer, max_length=1024, num_workers=35):
 def get_deepspeed_config(train_batch_size):
     """
     Generate a DeepSpeed configuration optimized for 2x19GB GPUs.
+    Uses "auto" for parameters that should match TrainingArguments.
     """
     return {
         "fp16": {
-            "enabled": True
+            "enabled": "auto"  # Use "auto" to match TrainingArguments fp16 setting
         },
         "zero_optimization": {
             "stage": 2,  # Stage 2 for balancing memory and speed
@@ -266,8 +267,8 @@ def get_deepspeed_config(train_batch_size):
             "contiguous_gradients": True,
             "overlap_comm": True
         },
-        "gradient_accumulation_steps": 1,  # We handle this in training args
-        "train_micro_batch_size_per_gpu": train_batch_size,
+        "gradient_accumulation_steps": "auto",  # Use "auto" to match TrainingArguments
+        "train_micro_batch_size_per_gpu": "auto",  # Use "auto" to match batch size from TrainingArguments
         "gradient_clipping": 1.0,
         "steps_per_print": 10,
     }
