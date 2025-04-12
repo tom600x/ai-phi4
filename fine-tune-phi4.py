@@ -276,9 +276,10 @@ def get_deepspeed_config(train_batch_size):
 class DebugTrainer(Trainer):
     """Custom trainer class that validates loss before backward pass"""
     
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
-        Override compute_loss to add validation before backward pass
+        Override compute_loss to add validation before backward pass.
+        Added **kwargs to handle additional arguments like num_items_in_batch.
         """
         outputs = model(**inputs)
         loss = outputs.loss
