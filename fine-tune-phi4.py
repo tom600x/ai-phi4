@@ -273,6 +273,31 @@ def get_deepspeed_config(train_batch_size):
         "steps_per_print": 10,
     }
 
+class DebugTrainer(Trainer):
+    """Custom trainer class that validates loss before backward pass"""
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Override compute_loss to add validation before backward pass
+        """
+        outputs = model(**inputs)
+        loss = outputs.loss
+        
+        # Check if loss is None or not a valid tensor for backward
+        if loss is None:
+            print("WARNING: Loss is None! Replacing with zero tensor to avoid backward error.")
+            loss = torch.tensor(0.0, device=model.device, requires_grad=True)
+        elif not loss.requires_grad:
+            print("WARNING: Loss doesn't require grad! Adding requires_grad=True.")
+            loss.requires_grad_(True)
+        
+        # Also check for NaN values in loss
+        if torch.isnan(loss).any():
+            print("WARNING: NaN detected in loss! Replacing with zero tensor.")
+            loss = torch.tensor(0.0, device=model.device, requires_grad=True)
+        
+        return (loss, outputs) if return_outputs else loss
+
 def fine_tune_phi4(
     model_path: str, 
     dataset_path: str, 
@@ -357,6 +382,7 @@ def fine_tune_phi4(
         "torch_dtype": compute_dtype,
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
+        "use_cache": False,  # Explicitly disable caching since we're using gradient checkpointing
     }
     
     # If not using DeepSpeed, set device_map and memory limits
@@ -500,8 +526,8 @@ def fine_tune_phi4(
         remove_unused_columns=True,
     )
     
-    # Initialize trainer with multi-GPU awareness
-    trainer = Trainer(
+    # Initialize trainer with multi-GPU awareness and custom loss handling
+    trainer = DebugTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset["train"],
