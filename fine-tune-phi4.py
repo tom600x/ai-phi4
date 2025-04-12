@@ -353,15 +353,17 @@ def fine_tune_phi4(
     
     # Configure model distribution across both GPUs
     if use_deepspeed:
-        # When using DeepSpeed, don't use device_map as it's incompatible with distributed training
+        # When using DeepSpeed, don't use device_map and use CPU first
         device_map = None
+        device = "cpu"  # Start on CPU when using DeepSpeed
         print("Using DeepSpeed for distributed training - device_map disabled")
     else:
-        # Force model to use a single GPU instead of balanced distribution
-        device_map = {"": 0}  # Place all modules on GPU 0
+        # Force everything to GPU 0 when not using DeepSpeed
+        device_map = {"": 0}
+        device = "cuda:0"
         print("Using single GPU mode")
-    
-    # Configure quantization
+
+    # Configure quantization with explicit compute device
     quantization_config = None
     if use_4bit:
         print("Using 4-bit quantization")
@@ -369,14 +371,16 @@ def fine_tune_phi4(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_device="cpu" if use_deepspeed else "cuda:0"
         )
     elif use_8bit:
         print("Using 8-bit quantization")
         quantization_config = BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=True
+            llm_int8_has_fp16_weight=True,
+            llm_int8_compute_device="cpu" if use_deepspeed else "cuda:0"
         )
 
     # Load model with proper device configuration
@@ -385,13 +389,13 @@ def fine_tune_phi4(
         "torch_dtype": compute_dtype,
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
-        "use_cache": False,  # Explicitly disable caching since we're using gradient checkpointing
+        "use_cache": False,
     }
     
-    # Only set device_map if we're not using DeepSpeed
-    if device_map is not None:
+    if not use_deepspeed:
         model_load_kwargs["device_map"] = device_map
-    
+        model_load_kwargs["max_memory"] = {0: "36GiB", "cpu": "70GiB"}
+
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -401,15 +405,16 @@ def fine_tune_phi4(
         print(f"Error loading model: {str(e)}")
         print("Trying with more aggressive memory settings...")
         
-        # Try again with more aggressive settings
         if not use_4bit:
             print("Switching to 4-bit quantization")
-            model_load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4"
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_device="cpu" if use_deepspeed else "cuda:0"
             )
+            model_load_kwargs["quantization_config"] = quantization_config
             model_load_kwargs["torch_dtype"] = torch.float16
         
         if not use_deepspeed:
@@ -420,6 +425,10 @@ def fine_tune_phi4(
             **model_load_kwargs
         )
     
+    # Move model to the correct device if using DeepSpeed
+    if use_deepspeed:
+        model = model.to("cpu")  # Ensure model starts on CPU for DeepSpeed
+    
     free_memory()
     
     # Set up LoRA if requested
@@ -427,12 +436,6 @@ def fine_tune_phi4(
         print("Setting up LoRA for parameter-efficient fine-tuning")
         if use_8bit or use_4bit:
             model = prepare_model_for_kbit_training(model)
-            
-        # Ensure model is on the correct device before LoRA setup
-        if not use_deepspeed:
-            # When not using DeepSpeed, explicitly move to GPU 0
-            device = torch.device("cuda:0")
-            model = model.to(device)
             
         # Configure LoRA with optimized settings
         lora_config = LoraConfig(
@@ -443,30 +446,30 @@ def fine_tune_phi4(
             bias="none",
             task_type="CAUSAL_LM",
             inference_mode=False,
+            modules_to_save=None,  # Don't save any modules when using DeepSpeed
         )
         
         try:
             model = get_peft_model(model, lora_config)
-            # Ensure all LoRA weights are on the same device
             if not use_deepspeed:
-                model = model.to(device)
+                model = model.to(device)  # Only move to GPU if not using DeepSpeed
             model.print_trainable_parameters()
         except ValueError as e:
             print(f"Error with specified target modules: {str(e)}")
             print("Falling back to automatic target module detection...")
-            # Fallback to automatic target module detection
             lora_config = LoraConfig(
                 r=lora_r,
                 lora_alpha=lora_alpha,
-                target_modules=None,  # Auto-detect
+                target_modules=None,
                 lora_dropout=lora_dropout,
                 bias="none",
                 task_type="CAUSAL_LM",
                 inference_mode=False,
+                modules_to_save=None,
             )
             model = get_peft_model(model, lora_config)
             if not use_deepspeed:
-                model = model.to(device)
+                model = model.to(device)  # Only move to GPU if not using DeepSpeed
             model.print_trainable_parameters()
             print(f"Auto-detected target modules: {model.peft_config['default'].target_modules}")
     
