@@ -352,11 +352,14 @@ def fine_tune_phi4(
             tokenizer.pad_token = "</s>"
     
     # Configure model distribution across both GPUs
-    device_map = "auto"
-    if not use_deepspeed:  # If not using DeepSpeed, manually distribute model
-        # Force model to use a single GPU instead of balanced distribution to avoid tensor device mismatches
+    if use_deepspeed:
+        # When using DeepSpeed, don't use device_map as it's incompatible with distributed training
+        device_map = None
+        print("Using DeepSpeed for distributed training - device_map disabled")
+    else:
+        # Force model to use a single GPU instead of balanced distribution
         device_map = {"": 0}  # Place all modules on GPU 0
-        print("Using single GPU to avoid tensor device mismatches")
+        print("Using single GPU mode")
     
     # Configure quantization
     quantization_config = None
@@ -376,21 +379,18 @@ def fine_tune_phi4(
             llm_int8_has_fp16_weight=True
         )
 
-    # Load model with single-GPU optimization to avoid tensor device mismatches
+    # Load model with proper device configuration
     model_load_kwargs = {
         "quantization_config": quantization_config,
         "torch_dtype": compute_dtype,
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
         "use_cache": False,  # Explicitly disable caching since we're using gradient checkpointing
-        "device_map": device_map,
     }
     
-    # If not using DeepSpeed, set memory limits for single GPU
-    if not use_deepspeed:
-        model_load_kwargs.update({
-            "max_memory": {0: "36GiB", "cpu": "70GiB"}  # Allocate all GPU memory to device 0
-        })
+    # Only set device_map if we're not using DeepSpeed
+    if device_map is not None:
+        model_load_kwargs["device_map"] = device_map
     
     try:
         model = AutoModelForCausalLM.from_pretrained(
