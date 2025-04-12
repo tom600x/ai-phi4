@@ -19,7 +19,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 # 3. Format the prompt for conversation-style input
-test_input = "Convert the following PL/SQL code to C# LINQ: \n\nSELECT * FROM users WHERE age > 30"
+test_input = "Convert the following PL/SQL query to LINQ: CREATE OR REPLACE PROCEDURE call_rest_api(p_url IN VARCHAR2, p_response OUT CLOB) IS\n v_http_request UTL_HTTP.req;\n v_http_response UTL_HTTP.resp;\nBEGIN\n v_http_request := UTL_HTTP.begin_request(p_url, 'GET');\n v_http_response := UTL_HTTP.get_response(v_http_request);\n UTL_HTTP.read_text(v_http_response, p_response);\n UTL_HTTP.end_response(v_http_response);\nEXCEPTION\n WHEN others THEN\n DBMS_OUTPUT.PUT_LINE('Error: ' || SQLERRM);\nEND; Description: Call a REST API using PL/SQL and handle errors.."
 formatted_input = f"<|user|>\n{test_input}\n<|assistant|>\n"
 
 # 4. Generate text with your fine-tuned model
@@ -31,7 +31,7 @@ with torch.no_grad():
     output = model.generate(
         **inputs,
         max_length=512,
-        temperature=0.7,
+        temperature=0.1,
         top_p=0.9,
         repetition_penalty=1.2,
         do_sample=True
