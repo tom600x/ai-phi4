@@ -54,7 +54,7 @@ def load_phi4_model(model_path="/home/TomAdmin/phi-4", use_gpu=True):
         print(f"Error loading model: {str(e)}")
         raise
 
-def generate_response(model, tokenizer, prompt, max_length=100, temperature=0.7):
+def generate_response(model, tokenizer, prompt, max_length=1000, temperature=0.1):
     """Generate a response using the Phi-4 model using the simple approach from test_phi4.py."""
     try:
         print(f"Processing prompt: '{prompt}'")
