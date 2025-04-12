@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Fine-tuning script optimized for Phi-4 using high-performance hardware with dual-GPU optimization
+# Fine-tuning script optimized for Phi-4 using high-performance hardware with strict single-GPU mode
 # Usage: python fine-tune-phi4.py
 
 import json
@@ -10,6 +10,19 @@ import psutil
 import argparse
 import numpy as np
 from typing import Dict, List, Union, Optional
+
+# IMPORTANT: Set CUDA_VISIBLE_DEVICES at the very beginning before any imports
+if __name__ == "__main__":
+    # Parse just the deepspeed argument first
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--no_deepspeed", action="store_true")
+    pre_args, _ = parser.parse_known_args()
+    
+    # If not using DeepSpeed, force only GPU 0 to be visible
+    if pre_args.no_deepspeed and torch.cuda.device_count() > 1:
+        print("Single GPU mode activated. Only using GPU 0.")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 from transformers import (
     AutoModelForCausalLM, 
     AutoTokenizer, 
@@ -281,21 +294,29 @@ class DebugTrainer(Trainer):
         Override compute_loss to add validation before backward pass.
         Added **kwargs to handle additional arguments like num_items_in_batch.
         """
+        # Ensure all inputs are on the same device as the model
+        model_device = next(model.parameters()).device
+        
+        # Force all inputs to the model's device
+        for key in inputs:
+            if isinstance(inputs[key], torch.Tensor) and inputs[key].device != model_device:
+                inputs[key] = inputs[key].to(model_device)
+                
         outputs = model(**inputs)
         loss = outputs.loss
         
         # Check if loss is None or not a valid tensor for backward
         if loss is None:
-            print("WARNING: Loss is None! Replacing with zero tensor to avoid backward error.")
-            loss = torch.tensor(0.0, device=model.device, requires_grad=True)
+            print("WARNING: Loss is None! Replacing with zero tensor.")
+            loss = torch.tensor(0.0, device=model_device, requires_grad=True)
         elif not loss.requires_grad:
             print("WARNING: Loss doesn't require grad! Adding requires_grad=True.")
             loss.requires_grad_(True)
         
-        # Also check for NaN values in loss
+        # Check for NaN values in loss
         if torch.isnan(loss).any():
             print("WARNING: NaN detected in loss! Replacing with zero tensor.")
-            loss = torch.tensor(0.0, device=model.device, requires_grad=True)
+            loss = torch.tensor(0.0, device=model_device, requires_grad=True)
         
         return (loss, outputs) if return_outputs else loss
 
@@ -305,21 +326,20 @@ def fine_tune_phi4(
     output_dir: str, 
     use_lora: bool = True,
     epochs: int = 3, 
-    batch_size: int = 4,     # Increased for dual-GPU
-    gradient_accumulation_steps: int = 4,  # Optimized for dual-GPU
+    batch_size: int = 2,
+    gradient_accumulation_steps: int = 8,
     learning_rate: float = 2e-5,
-    lora_r: int = 16,        # Increased for higher capacity
-    lora_alpha: int = 32,    # Increased for better training dynamics
+    lora_r: int = 16,
+    lora_alpha: int = 32,
     lora_dropout: float = 0.05,
-    max_length: int = 1024,  # Increased for larger context windows
+    max_length: int = 768,
     use_8bit: bool = True,   
     use_4bit: bool = False,
     use_deepspeed: bool = True,
-    offload_modules: bool = False,  # Less need with dual GPUs
     max_samples: int = None
 ):
     """
-    Fine-tune Microsoft Phi-4 model optimized for dual-GPU setup with 19GB each.
+    Fine-tune Microsoft Phi-4 model with strict device control.
     """
     print_system_info()
     
@@ -337,9 +357,14 @@ def fine_tune_phi4(
 
     # Determine compute dtype based on available hardware
     compute_dtype = torch.float16
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
-        print("Using bfloat16 precision")
-        compute_dtype = torch.bfloat16
+    
+    # Set the target device explicitly
+    if use_deepspeed:
+        target_device = "cpu"  # Start on CPU for DeepSpeed
+    else:
+        target_device = "cuda:0"  # Force GPU 0 in single-GPU mode
+    
+    print(f"Target device for model: {target_device}")
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -351,19 +376,10 @@ def fine_tune_phi4(
         else:
             tokenizer.pad_token = "</s>"
     
-    # Configure model distribution across both GPUs
-    if use_deepspeed:
-        # When using DeepSpeed, don't use device_map and use CPU first
-        device_map = None
-        device = "cpu"  # Start on CPU when using DeepSpeed
-        print("Using DeepSpeed for distributed training - device_map disabled")
-    else:
-        # Force everything to GPU 0 when not using DeepSpeed
-        device_map = {"": 0}
-        device = "cuda:0"
-        print("Using single GPU mode")
-
-    # Configure quantization with explicit compute device
+    # Device map explicitly set to None for DeepSpeed or single-GPU mode
+    device_map = None if use_deepspeed else {"": 0}
+    
+    # Configure quantization (with explicit compute device)
     quantization_config = None
     if use_4bit:
         print("Using 4-bit quantization")
@@ -372,7 +388,7 @@ def fine_tune_phi4(
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_device="cpu" if use_deepspeed else "cuda:0"
+            bnb_4bit_compute_device=target_device
         )
     elif use_8bit:
         print("Using 8-bit quantization")
@@ -380,10 +396,10 @@ def fine_tune_phi4(
             load_in_8bit=True,
             llm_int8_threshold=6.0,
             llm_int8_has_fp16_weight=True,
-            llm_int8_compute_device="cpu" if use_deepspeed else "cuda:0"
+            llm_int8_compute_device=target_device
         )
 
-    # Load model with proper device configuration
+    # Standardized model loading arguments
     model_load_kwargs = {
         "quantization_config": quantization_config,
         "torch_dtype": compute_dtype,
@@ -392,44 +408,52 @@ def fine_tune_phi4(
         "use_cache": False,
     }
     
-    if not use_deepspeed:
+    # Add device map for single-GPU mode only
+    if device_map is not None:
         model_load_kwargs["device_map"] = device_map
-        model_load_kwargs["max_memory"] = {0: "36GiB", "cpu": "70GiB"}
 
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            **model_load_kwargs
-        )
+        # Load the model
+        print(f"Loading model with {model_load_kwargs}")
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_load_kwargs)
+        
+        # Explicitly move to target device after loading
+        if not use_deepspeed:
+            model = model.to(target_device)
+            print(f"Model moved to {target_device}")
+            
     except Exception as e:
         print(f"Error loading model: {str(e)}")
         print("Trying with more aggressive memory settings...")
         
+        # Try again with more conservative settings
         if not use_4bit:
             print("Switching to 4-bit quantization")
-            quantization_config = BitsAndBytesConfig(
+            model_load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_device="cpu" if use_deepspeed else "cuda:0"
+                bnb_4bit_compute_device=target_device
             )
-            model_load_kwargs["quantization_config"] = quantization_config
             model_load_kwargs["torch_dtype"] = torch.float16
-        
-        if not use_deepspeed:
-            model_load_kwargs["max_memory"] = {0: "16GiB", "cpu": "70GiB"}
             
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            **model_load_kwargs
-        )
-    
-    # Move model to the correct device if using DeepSpeed
-    if use_deepspeed:
-        model = model.to("cpu")  # Ensure model starts on CPU for DeepSpeed
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_load_kwargs)
+        
+        # Explicitly move to target device after loading
+        if not use_deepspeed:
+            model = model.to(target_device)
     
     free_memory()
+    
+    # Print model device info for debugging
+    device_info = {}
+    for name, param in model.named_parameters():
+        if param.device not in device_info:
+            device_info[param.device] = 1
+        else:
+            device_info[param.device] += 1
+    print("Model parameters by device:", device_info)
     
     # Set up LoRA if requested
     if use_lora:
@@ -437,7 +461,7 @@ def fine_tune_phi4(
         if use_8bit or use_4bit:
             model = prepare_model_for_kbit_training(model)
             
-        # Configure LoRA with optimized settings
+        # Configure LoRA with explicit modules to avoid detection issues
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -446,40 +470,52 @@ def fine_tune_phi4(
             bias="none",
             task_type="CAUSAL_LM",
             inference_mode=False,
-            modules_to_save=None,  # Don't save any modules when using DeepSpeed
+            modules_to_save=None,
         )
         
         try:
             model = get_peft_model(model, lora_config)
             if not use_deepspeed:
-                model = model.to(device)  # Only move to GPU if not using DeepSpeed
+                # Double-check the model is on the right device after LoRA setup
+                model = model.to(target_device)
             model.print_trainable_parameters()
         except ValueError as e:
             print(f"Error with specified target modules: {str(e)}")
             print("Falling back to automatic target module detection...")
+            # Fallback to automatic target module detection
             lora_config = LoraConfig(
                 r=lora_r,
                 lora_alpha=lora_alpha,
-                target_modules=None,
+                target_modules=None,  # Auto-detect
                 lora_dropout=lora_dropout,
                 bias="none",
                 task_type="CAUSAL_LM",
                 inference_mode=False,
-                modules_to_save=None,
             )
             model = get_peft_model(model, lora_config)
             if not use_deepspeed:
-                model = model.to(device)  # Only move to GPU if not using DeepSpeed
+                # Double-check the model is on the right device after LoRA setup
+                model = model.to(target_device)
             model.print_trainable_parameters()
             print(f"Auto-detected target modules: {model.peft_config['default'].target_modules}")
     
     free_memory()
     
-    # Load dataset with optimized processing for 70 vCPUs
+    # Print model device info again after LoRA
+    if use_lora:
+        device_info = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.device not in device_info:
+                device_info[param.device] = 1
+            elif param.requires_grad:
+                device_info[param.device] += 1
+        print("Trainable parameters by device:", device_info)
+    
+    # Load dataset with optimized processing
     dataset = load_phi4_dataset(dataset_path, max_samples=max_samples)
     free_memory()
     
-    # Tokenize dataset with multi-CPU optimization
+    # Tokenize dataset
     cpu_workers = min(35, os.cpu_count() // 2)  # Use half of available vCPUs for tokenization
     tokenized_dataset = tokenize_phi4_dataset(dataset, tokenizer, max_length=max_length, num_workers=cpu_workers)
     free_memory()
@@ -490,23 +526,18 @@ def fine_tune_phi4(
         mlm=False  # We want causal language modeling, not masked
     )
     
-    # Determine effective batch size accounting for 2 GPUs
-    num_gpus = torch.cuda.device_count()
-    effective_batch_size = batch_size * gradient_accumulation_steps * num_gpus
-    print(f"Effective batch size: {effective_batch_size} (batch_size={batch_size} × gradient_accumulation={gradient_accumulation_steps} × num_gpus={num_gpus})")
-    
     # Configure DeepSpeed if available and requested
     deepspeed_config = None
     if HAS_DEEPSPEED and use_deepspeed:
         deepspeed_config = get_deepspeed_config(batch_size)
         print("Using DeepSpeed configuration for multi-GPU training")
     
-    # Configure training arguments optimized for dual-GPU setup
+    # Configure training arguments 
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size // 2,  # Half training batch size
+        per_device_eval_batch_size=batch_size // 2,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -521,28 +552,24 @@ def fine_tune_phi4(
         logging_steps=10,
         save_strategy="steps",
         save_steps=200,
-        save_total_limit=3,  # Keep 3 checkpoints with more available memory
+        save_total_limit=3,
         fp16=not (use_8bit or use_4bit) and compute_dtype == torch.float16,
-        bf16=not (use_8bit or use_4bit) and compute_dtype == torch.bfloat16,
+        bf16=False,  # Disable bfloat16 to avoid compatibility issues
         report_to="tensorboard",
         run_name=f"phi4_finetune_{os.path.basename(output_dir)}",
-        # Multi-GPU settings
+        # GPU settings
         deepspeed=deepspeed_config,
-        local_rank=-1,  # Auto-detect for distributed training
-        dataloader_num_workers=cpu_workers // 2,  # Optimize data loading for 70 vCPUs
-        group_by_length=True,  # Better for multi-GPU efficiency
-        gradient_checkpointing=True,  # Still useful for memory efficiency
+        local_rank=-1,
+        dataloader_num_workers=min(4, cpu_workers // 2),  # Limit workers to avoid issues
+        group_by_length=False,  # Disable for simplicity
+        gradient_checkpointing=True,
         ddp_find_unused_parameters=False,
-        torch_compile=False,  # Can be enabled for PyTorch 2.0+ if available
-        optim="adamw_torch_fused",  # Use fused optimizer for better performance
-        # Set these if your transformers version supports them
-        # greater_is_better=False,
-        # load_best_model_at_end=True,
-        # metric_for_best_model="eval_loss",
+        torch_compile=False,
+        optim="adamw_torch",  # Use standard optimizer for compatibility
         remove_unused_columns=True,
     )
     
-    # Initialize trainer with multi-GPU awareness and custom loss handling
+    # Initialize trainer with custom debug trainer for device consistency
     trainer = DebugTrainer(
         model=model,
         args=training_args,
@@ -555,18 +582,19 @@ def fine_tune_phi4(
     free_memory()
     
     # Train model
-    print("\n=== Starting Training on Multiple GPUs ===")
+    print("\n=== Starting Training ===")
     
     try:
         trainer.train()
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
-            print("\nERROR: CUDA out of memory. Try reducing batch size or enabling DeepSpeed.")
-            print("For dual 19GB GPUs, recommended settings:")
-            print("1. Use DeepSpeed with Zero stage 2/3")
-            print("2. Use gradient_accumulation_steps=4 with batch_size=4")
-            print("3. Enable 8-bit quantization")
-            print("4. Set max_length to 1024 or lower")
+            print("\nERROR: CUDA out of memory. Try reducing batch size further.")
+            print("Recommended settings for single GPU:")
+            print("1. Use batch_size=1 and gradient_accumulation=16")
+            print("2. Enable 4-bit quantization")
+            print("3. Reduce max_length to 512")
+        # Print complete error for debugging
+        print(f"Full error: {str(e)}")
         raise
     
     # Save model
@@ -583,43 +611,33 @@ def fine_tune_phi4(
     
     print(f"Model fine-tuning complete! Model saved to {output_dir}")
 
-# Disable CUDA if available
-def disable_second_gpu():
-    """Disable the second GPU to ensure all tensors stay on a single device"""
-    if torch.cuda.device_count() > 1:
-        print("Disabling all GPUs except the first one to prevent device mismatch errors")
-        # Create an environment variable that restricts visible devices to only GPU 0
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        # This ensures only GPU 0 will be used for all operations
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune Microsoft Phi-4 model optimized for dual 19GB GPUs")
+    # Main argument parser (complete version)
+    parser = argparse.ArgumentParser(description="Fine-tune Microsoft Phi-4 model with strict device control")
     parser.add_argument("--model_path", type=str, default="microsoft/Phi-4", help="Path or name of the Phi-4 model")
     parser.add_argument("--dataset_path", type=str, default="phi4_fine_tuning_dataset.json", help="Path to the JSONL dataset file")
     parser.add_argument("--output_dir", type=str, default="output/phi4-finetuned", help="Directory to save the fine-tuned model")
     parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for parameter-efficient fine-tuning")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, help="Training batch size per device")
-    parser.add_argument("--gradient_accumulation", type=int, default=4, help="Number of steps to accumulate gradients")
+    parser.add_argument("--batch_size", type=int, default=2, help="Training batch size per device")
+    parser.add_argument("--gradient_accumulation", type=int, default=8, help="Number of steps to accumulate gradients")
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate for training")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA attention dimension")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha parameter")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout probability")
-    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
+    parser.add_argument("--max_length", type=int, default=768, help="Maximum sequence length")
     parser.add_argument("--use_8bit", action="store_true", default=True, help="Use 8-bit quantization")
     parser.add_argument("--use_4bit", action="store_true", help="Use 4-bit quantization (overrides 8-bit)")
-    parser.add_argument("--no_deepspeed", action="store_true", help="Disable DeepSpeed (use this for single GPU)")
-    parser.add_argument("--offload_modules", action="store_true", help="Offload model modules to CPU (less needed with dual-GPU)")
+    parser.add_argument("--no_deepspeed", action="store_true", help="Disable DeepSpeed (use single GPU)")
     parser.add_argument("--max_samples", type=int, help="Maximum number of samples to use for training")
     args = parser.parse_args()
     
-    # If not using DeepSpeed, disable second GPU to prevent device mismatch errors
-    if args.no_deepspeed:
-        disable_second_gpu()
+    # Print the current CUDA_VISIBLE_DEVICES setting
+    print(f"CUDA_VISIBLE_DEVICES = {os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}")
     
-    # For dual-GPU distributed training
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for training")
+    # Print available GPUs after potential restriction
+    if torch.cuda.is_available():
+        print(f"PyTorch sees {torch.cuda.device_count()} GPUs")
     
     fine_tune_phi4(
         model_path=args.model_path,
@@ -637,6 +655,5 @@ if __name__ == "__main__":
         use_8bit=args.use_8bit,
         use_4bit=args.use_4bit,
         use_deepspeed=not args.no_deepspeed,
-        offload_modules=args.offload_modules,
         max_samples=args.max_samples
     )
