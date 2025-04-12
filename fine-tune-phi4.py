@@ -583,6 +583,15 @@ def fine_tune_phi4(
     
     print(f"Model fine-tuning complete! Model saved to {output_dir}")
 
+# Disable CUDA if available
+def disable_second_gpu():
+    """Disable the second GPU to ensure all tensors stay on a single device"""
+    if torch.cuda.device_count() > 1:
+        print("Disabling all GPUs except the first one to prevent device mismatch errors")
+        # Create an environment variable that restricts visible devices to only GPU 0
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        # This ensures only GPU 0 will be used for all operations
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fine-tune Microsoft Phi-4 model optimized for dual 19GB GPUs")
     parser.add_argument("--model_path", type=str, default="microsoft/Phi-4", help="Path or name of the Phi-4 model")
@@ -603,6 +612,10 @@ if __name__ == "__main__":
     parser.add_argument("--offload_modules", action="store_true", help="Offload model modules to CPU (less needed with dual-GPU)")
     parser.add_argument("--max_samples", type=int, help="Maximum number of samples to use for training")
     args = parser.parse_args()
+    
+    # If not using DeepSpeed, disable second GPU to prevent device mismatch errors
+    if args.no_deepspeed:
+        disable_second_gpu()
     
     # For dual-GPU distributed training
     if torch.cuda.device_count() > 1:
