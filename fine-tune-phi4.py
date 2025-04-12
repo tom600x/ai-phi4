@@ -599,7 +599,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
     parser.add_argument("--use_8bit", action="store_true", default=True, help="Use 8-bit quantization")
     parser.add_argument("--use_4bit", action="store_true", help="Use 4-bit quantization (overrides 8-bit)")
-    parser.add_argument("--use_deepspeed", action="store_true", default=True, help="Use DeepSpeed for multi-GPU optimization")
+    parser.add_argument("--no_deepspeed", action="store_true", help="Disable DeepSpeed (use this for single GPU)")
     parser.add_argument("--offload_modules", action="store_true", help="Offload model modules to CPU (less needed with dual-GPU)")
     parser.add_argument("--max_samples", type=int, help="Maximum number of samples to use for training")
     args = parser.parse_args()
@@ -623,7 +623,7 @@ if __name__ == "__main__":
         max_length=args.max_length,
         use_8bit=args.use_8bit,
         use_4bit=args.use_4bit,
-        use_deepspeed=args.use_deepspeed,
+        use_deepspeed=not args.no_deepspeed,
         offload_modules=args.offload_modules,
         max_samples=args.max_samples
     )
