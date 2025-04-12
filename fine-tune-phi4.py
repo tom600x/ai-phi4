@@ -354,10 +354,9 @@ def fine_tune_phi4(
     # Configure model distribution across both GPUs
     device_map = "auto"
     if not use_deepspeed:  # If not using DeepSpeed, manually distribute model
-        # Optimal distribution across 2 GPUs
-        device_map = "balanced"  # Let HF auto-balance across the 2 GPUs
-        
-        print("Using balanced distribution across both GPUs")
+        # Force model to use a single GPU instead of balanced distribution to avoid tensor device mismatches
+        device_map = {"": 0}  # Place all modules on GPU 0
+        print("Using single GPU to avoid tensor device mismatches")
     
     # Configure quantization
     quantization_config = None
@@ -377,20 +376,20 @@ def fine_tune_phi4(
             llm_int8_has_fp16_weight=True
         )
 
-    # Load model with dual-GPU optimization
+    # Load model with single-GPU optimization to avoid tensor device mismatches
     model_load_kwargs = {
         "quantization_config": quantization_config,
         "torch_dtype": compute_dtype,
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
         "use_cache": False,  # Explicitly disable caching since we're using gradient checkpointing
+        "device_map": device_map,
     }
     
-    # If not using DeepSpeed, set device_map and memory limits
+    # If not using DeepSpeed, set memory limits for single GPU
     if not use_deepspeed:
         model_load_kwargs.update({
-            "device_map": device_map,
-            "max_memory": {0: "18GiB", 1: "18GiB", "cpu": "70GiB"}  # Balanced memory for both GPUs
+            "max_memory": {0: "36GiB", "cpu": "70GiB"}  # Allocate all GPU memory to device 0
         })
     
     try:
@@ -414,7 +413,7 @@ def fine_tune_phi4(
             model_load_kwargs["torch_dtype"] = torch.float16
         
         if not use_deepspeed:
-            model_load_kwargs["max_memory"] = {0: "16GiB", 1: "16GiB", "cpu": "70GiB"}
+            model_load_kwargs["max_memory"] = {0: "16GiB", "cpu": "70GiB"}
             
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -429,18 +428,28 @@ def fine_tune_phi4(
         if use_8bit or use_4bit:
             model = prepare_model_for_kbit_training(model)
             
-        # Configure LoRA with optimized settings for dual-GPU
+        # Ensure model is on the correct device before LoRA setup
+        if not use_deepspeed:
+            # When not using DeepSpeed, explicitly move to GPU 0
+            device = torch.device("cuda:0")
+            model = model.to(device)
+            
+        # Configure LoRA with optimized settings
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
             target_modules=["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
             lora_dropout=lora_dropout,
             bias="none",
-            task_type="CAUSAL_LM"
+            task_type="CAUSAL_LM",
+            inference_mode=False,
         )
         
         try:
             model = get_peft_model(model, lora_config)
+            # Ensure all LoRA weights are on the same device
+            if not use_deepspeed:
+                model = model.to(device)
             model.print_trainable_parameters()
         except ValueError as e:
             print(f"Error with specified target modules: {str(e)}")
@@ -452,9 +461,12 @@ def fine_tune_phi4(
                 target_modules=None,  # Auto-detect
                 lora_dropout=lora_dropout,
                 bias="none",
-                task_type="CAUSAL_LM"
+                task_type="CAUSAL_LM",
+                inference_mode=False,
             )
             model = get_peft_model(model, lora_config)
+            if not use_deepspeed:
+                model = model.to(device)
             model.print_trainable_parameters()
             print(f"Auto-detected target modules: {model.peft_config['default'].target_modules}")
     
