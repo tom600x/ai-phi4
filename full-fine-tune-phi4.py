@@ -96,7 +96,7 @@ def full_fine_tune_phi4(input_json_path, output_model_dir, num_epochs=3, batch_s
     dataset = dataset.train_test_split(test_size=0.1, seed=42)
     
     # Load the pre-trained Phi-4 model and tokenizer
-    model_name = "microsoft/Phi-4"
+    model_name = "/home/TomAdmin/phi-4"
     
     print(f"Loading tokenizer from {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -135,7 +135,7 @@ def full_fine_tune_phi4(input_json_path, output_model_dir, num_epochs=3, batch_s
         weight_decay=0.01,
         logging_dir=os.path.join(output_model_dir, 'logs'),
         logging_steps=10,
-        evaluation_strategy="epoch",
+    #    evaluation_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=2,
         fp16=torch.cuda.is_available(),

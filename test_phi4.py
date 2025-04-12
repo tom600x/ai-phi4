@@ -3,7 +3,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Set paths for model loading
-model_path = "/home/TomAdmin/ai-phi-4/output/phi4-finetuned"  # Path to your fully fine-tuned model
+model_path = "/home/TomAdmin/ai-phi4/output/phi4-finetuned"  # Path to your fully fine-tuned model
 
 # 1. Load the tokenizer from the fine-tuned model directory
 print(f"Loading tokenizer from {model_path}...")
