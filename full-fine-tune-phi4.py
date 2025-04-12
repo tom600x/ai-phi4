@@ -10,27 +10,50 @@ import os
 
 def load_dataset(json_path):
     """Load and process conversation dataset from JSON file."""
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = [json.loads(line) if line.strip() else {} for line in f.readlines()]
-        if not data or not isinstance(data[0], dict):
-            # If the file isn't in JSONL format, try loading as a regular JSON array
-            f.seek(0)
-            data = json.load(f)
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            # Try first as JSONL format (each line is a JSON object)
+            data = []
+            for line in f:
+                if line.strip():
+                    try:
+                        data.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+            
+            # If no valid data was loaded, try as a regular JSON array or object
+            if not data:
+                f.seek(0)
+                try:
+                    data = json.load(f)
+                    # If it's not a list, make it a list
+                    if not isinstance(data, list):
+                        data = [data]
+                except json.JSONDecodeError:
+                    raise ValueError(f"Could not parse {json_path} as JSON or JSONL")
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        raise
     
     # Extract and format conversations
     formatted_data = []
     for item in data:
         if "messages" in item:
-            # Format the conversation as a single text for the model
             conversation = ""
             messages = item["messages"]
-            for message in messages:
+            
+            for i, message in enumerate(messages):
                 role = message.get("role", "")
                 content = message.get("content", "")
-                conversation += f"{role}: {content}\n\n"
+                
+                if role == "user":
+                    conversation += f"<|user|>\n{content}\n"
+                elif role == "assistant":
+                    conversation += f"<|assistant|>\n{content}\n"
             
             formatted_data.append({"text": conversation})
     
+    print(f"Processed {len(formatted_data)} conversations from the dataset")
     return Dataset.from_dict({"text": [item["text"] for item in formatted_data]})
 
 def tokenize_dataset(dataset, tokenizer):
@@ -40,12 +63,18 @@ def tokenize_dataset(dataset, tokenizer):
             examples["text"],
             padding="max_length",
             truncation=True,
-            max_length=1024,  # Adjust based on your model and data
+            max_length=2048,  # Increased max length for longer conversations
             return_tensors="pt"
         )
         
         # Set labels equal to input_ids for causal language modeling
         results["labels"] = results["input_ids"].clone()
+        
+        # Set padding token ids to -100 so they don't contribute to the loss
+        for i, label in enumerate(results["labels"]):
+            mask = results["attention_mask"][i] == 0
+            results["labels"][i][mask] = -100
+            
         return results
     
     tokenized_dataset = dataset.map(
@@ -64,13 +93,15 @@ def full_fine_tune_phi4(input_json_path, output_model_dir, num_epochs=3, batch_s
     print(f"Dataset loaded with {len(dataset)} examples")
     
     # Split dataset into training and evaluation sets (90/10 split)
-    dataset = dataset.train_test_split(test_size=0.1)
+    dataset = dataset.train_test_split(test_size=0.1, seed=42)
     
     # Load the pre-trained Phi-4 model and tokenizer
-    model_name = "microsoft/Phi-4"  # Correct model identifier for Phi-4
+    model_name = "microsoft/Phi-4"
     
     print(f"Loading tokenizer from {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    
+    # Ensure we have proper padding and EOS tokens
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
@@ -93,7 +124,7 @@ def full_fine_tune_phi4(input_json_path, output_model_dir, num_epochs=3, batch_s
     # Create output directory if it doesn't exist
     os.makedirs(output_model_dir, exist_ok=True)
     
-    # Define training arguments
+    # Define training arguments with optimized settings for Phi-4
     training_args = TrainingArguments(
         output_dir=output_model_dir,
         num_train_epochs=num_epochs,
@@ -109,9 +140,13 @@ def full_fine_tune_phi4(input_json_path, output_model_dir, num_epochs=3, batch_s
         save_total_limit=2,
         fp16=torch.cuda.is_available(),
         report_to="tensorboard",
-        gradient_accumulation_steps=2,  # To help with memory usage
+        gradient_accumulation_steps=4,  # Increased for better stability
         gradient_checkpointing=True,    # To help with memory usage
         optim="adamw_torch",
+        lr_scheduler_type="cosine",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
     )
     
     # Initialize the Trainer
@@ -133,6 +168,44 @@ def full_fine_tune_phi4(input_json_path, output_model_dir, num_epochs=3, batch_s
     tokenizer.save_pretrained(output_model_dir)
     print("Training complete!")
 
+def test_fine_tuned_model(model_path, test_input):
+    """Test the fine-tuned model with a sample input."""
+    print(f"Loading fine-tuned model from {model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto" if torch.cuda.is_available() else None,
+        trust_remote_code=True
+    )
+    
+    # Format the test input for the model
+    formatted_input = f"<|user|>\n{test_input}\n<|assistant|>\n"
+    
+    # Generate a response
+    inputs = tokenizer(formatted_input, return_tensors="pt")
+    if torch.cuda.is_available():
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    
+    print("Generating response...")
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_length=2048,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            do_sample=True
+        )
+    
+    # Decode the response
+    response = tokenizer.decode(output[0], skip_special_tokens=False)
+    
+    # Extract just the assistant's response
+    assistant_response = response.split("<|assistant|>")[-1].strip()
+    
+    return assistant_response
+
 if __name__ == "__main__":
     import argparse
     
@@ -147,6 +220,11 @@ if __name__ == "__main__":
                         help="Training batch size.")
     parser.add_argument("--learning_rate", type=float, default=2e-5, 
                         help="Learning rate for training.")
+    parser.add_argument("--test", action="store_true",
+                        help="Test the fine-tuned model after training.")
+    parser.add_argument("--test_input", type=str, 
+                        default="Convert the following PL/SQL code to C# LINQ: \n\nSELECT * FROM employees WHERE department_id = 10;",
+                        help="Test input for the fine-tuned model.")
     
     args = parser.parse_args()
     
@@ -157,3 +235,9 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         learning_rate=args.learning_rate
     )
+    
+    if args.test:
+        print("\nTesting fine-tuned model...")
+        response = test_fine_tuned_model(args.output_model_dir, args.test_input)
+        print("\nModel response:")
+        print(response)
