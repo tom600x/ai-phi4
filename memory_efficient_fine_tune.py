@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-# Full model fine-tuning script for Microsoft Phi-4
-# This script performs complete model fine-tuning (not just LoRA) and saves the full trained model
-# Adapted from existing fine-tuning scripts for optimal compatibility with phi4_fine_tuning_dataset.json
+# Memory-efficient fine-tuning script for Phi-4
+# Uses 8-bit quantization and LoRA to minimize GPU memory requirements
+# Specifically optimized for phi4_fine_tuning_dataset.json
 
 import json
 import torch
@@ -13,23 +13,28 @@ from transformers import (
     AutoModelForCausalLM, 
     Trainer, 
     TrainingArguments,
-    DataCollatorForLanguageModeling
+    DataCollatorForLanguageModeling,
+    BitsAndBytesConfig
+)
+from peft import (
+    prepare_model_for_kbit_training,
+    LoraConfig,
+    get_peft_model,
+    TaskType
 )
 from datasets import Dataset
 import argparse
 import numpy as np
 
-# Set environment variable to help with memory fragmentation
+# Set environment variables to optimize memory usage
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
-
-# Force PyTorch to use a specific GPU device 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Only use the first GPU
 DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-# Enable aggressive GPU memory savings
-torch.backends.cuda.matmul.allow_tf32 = True  # Use tensor cores if available
-torch.backends.cudnn.benchmark = True  # Use cudnn auto-tuner
-torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms if faster
+# Memory optimization settings
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 
 def print_system_info():
     """Print system information including GPU, CPU and memory."""
@@ -51,6 +56,7 @@ def print_system_info():
         print("No GPU available, using CPU only")
     print("===========================\n")
 
+
 def free_memory():
     """Aggressively free GPU and CPU memory."""
     gc.collect()
@@ -65,6 +71,7 @@ def free_memory():
                        for i in range(torch.cuda.device_count())]))
     else:
         print("No CUDA available for memory cleanup")
+
 
 def load_dataset(json_path, max_samples=None):
     """Load and process conversation dataset from JSON/JSONL file."""
@@ -133,8 +140,9 @@ def load_dataset(json_path, max_samples=None):
         'validation': train_val_split['test']
     }
 
-def tokenize_dataset(dataset, tokenizer, max_length=2048):
-    """Tokenize the dataset for training."""
+
+def tokenize_dataset(dataset, tokenizer, max_length=512):
+    """Tokenize the dataset for training with a shorter sequence length to save memory."""
     def tokenize_function(examples):
         results = tokenizer(
             examples["text"],
@@ -154,13 +162,14 @@ def tokenize_dataset(dataset, tokenizer, max_length=2048):
             
         return results
     
-    # Apply tokenization to each split
+    # Apply tokenization to each split using smaller batch size to save memory
     tokenized_dataset = {}
     for split in dataset:
         print(f"Tokenizing {split} split...")
         tokenized_dataset[split] = dataset[split].map(
             tokenize_function,
             batched=True,
+            batch_size=8,  # Small batch size for tokenizing
             remove_columns=["text"],
             desc=f"Tokenizing {split} dataset"
         )
@@ -169,30 +178,32 @@ def tokenize_dataset(dataset, tokenizer, max_length=2048):
     print("Dataset tokenized successfully.")
     return tokenized_dataset
 
-def full_fine_tune_phi4(
+
+def memory_efficient_fine_tune(
     model_path: str, 
     dataset_path: str, 
     output_dir: str, 
     num_epochs: int = 3,
-    batch_size: int = 1,  # Reduced default batch size
-    gradient_accumulation_steps: int = 16,  # Increased gradient accumulation
-    learning_rate: float = 2e-5,
-    max_length: int = 1024,  # Reduced sequence length
+    batch_size: int = 1,
+    gradient_accumulation_steps: int = 16,
+    learning_rate: float = 2e-4,
+    max_length: int = 512,
     max_samples: int = None,
-    save_strategy: str = "epoch",
-    eval_steps: int = 500
+    lora_r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    save_strategy: str = "steps",
+    save_steps: int = 50
 ):
     """
-    Perform full fine-tuning on the Phi-4 model with the entire model's parameters.
+    Memory-efficient fine-tuning for Phi-4 using LoRA and 8-bit quantization.
     """
     print_system_info()
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
-    # Determine appropriate compute type based on available hardware
-    compute_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8 else torch.float16
-    
+    # Load tokenizer
     print(f"Loading tokenizer from {model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     
@@ -200,50 +211,72 @@ def full_fine_tune_phi4(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    print(f"Loading model from {model_path}...")
+    # 8-bit quantization config for memory efficiency
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=6.0,
+        llm_int8_has_fp16_weight=False
+    )
     
-    # Use a fixed device map to avoid mixing devices
-    device_map = {"": 0}  # Force all modules to GPU 0
-    
+    # Load model with quantization
+    print(f"Loading model from {model_path} with 8-bit quantization...")
     try:
-        # Load model with explicit device map to ensure all weights are on the same GPU
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=compute_dtype,
-            device_map=device_map,  # Use fixed device map
+            quantization_config=quantization_config,
+            device_map={'': 0},  # Place on GPU 0
             trust_remote_code=True,
-            low_cpu_mem_usage=True
+            torch_dtype=torch.float16
         )
-        # Explicitly move model to default device to ensure consistency
-        model = model.to(DEFAULT_DEVICE)
     except Exception as e:
-        print(f"Error loading model with fixed device map: {e}")
-        print("Trying CPU offloading as fallback...")
+        print(f"Error loading model with quantization: {e}")
+        print("Trying more aggressive memory saving options...")
         
-        # Fall back to CPU offloading if GPU memory is insufficient
+        # More aggressive config with 4-bit
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True
+        )
+        
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=compute_dtype,
-            device_map="cpu",  # Load to CPU first
+            quantization_config=quantization_config,
+            device_map="auto",
             trust_remote_code=True,
-            low_cpu_mem_usage=True
+            torch_dtype=torch.float16
         )
-        # Move parts of the model to GPU as possible
-        try:
-            model = model.to(DEFAULT_DEVICE)
-            print("Successfully moved model to GPU")
-        except Exception as e:
-            print(f"Couldn't move full model to GPU, keeping on CPU: {e}")
     
-    # Prepare model for training
-    model.config.use_cache = False  # Important for training efficiency
+    # Prepare model for kbit training
+    model.config.use_cache = False
+    model = prepare_model_for_kbit_training(model)
     
+    # Define LoRA configuration
+    print("Setting up LoRA adapters...")
+    # For Phi-4, these are the typical attention layers that work well with LoRA
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    
+    lora_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False
+    )
+    
+    # Get PEFT model
+    model = get_peft_model(model, lora_config)
     free_memory()
     
-    # Load and tokenize dataset
+    # Print trainable parameters
+    model.print_trainable_parameters()
+    
+    # Load and process dataset
     print(f"Loading dataset from {dataset_path}...")
     dataset = load_dataset(dataset_path, max_samples=max_samples)
-    
     print(f"Dataset loaded: {len(dataset['train'])} training samples, {len(dataset['validation'])} validation samples")
     free_memory()
     
@@ -255,45 +288,39 @@ def full_fine_tune_phi4(
     # Prepare data collator
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        mlm=False  # We want causal language modeling, not masked
+        mlm=False
     )
     
-    # Define training arguments with optimized settings for Phi-4
-    # Note: Removed evaluation_strategy parameter which is causing the error
+    # Training arguments
+    print("Setting up training arguments...")
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
-        warmup_ratio=0.1,
         weight_decay=0.01,
-        logging_dir=os.path.join(output_dir, 'logs'),
         logging_steps=10,
         save_strategy=save_strategy,
+        save_steps=save_steps if save_strategy == "steps" else None,
         save_total_limit=2,
-        fp16=torch.cuda.is_available() and compute_dtype == torch.float16,
-        bf16=torch.cuda.is_available() and compute_dtype == torch.bfloat16,
-        report_to="tensorboard",
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        gradient_checkpointing=True,  # To help with memory usage
+        fp16=True,  # Use fp16 for faster training with quantized models
+        report_to="none",  # Disable reporting to save memory
+        gradient_checkpointing=True,
         optim="adamw_torch",
         lr_scheduler_type="cosine",
-        # Use these if your transformers version supports them:
-        # eval_steps=eval_steps,
-        # load_best_model_at_end=True, 
-        # metric_for_best_model="loss",
-        # greater_is_better=False,
+        warmup_ratio=0.05,
     )
     
-    # Initialize the Trainer
+    # Initialize trainer
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset["train"],
         eval_dataset=tokenized_dataset["validation"],
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        tokenizer=tokenizer
     )
     
     # Fine-tune the model
@@ -302,38 +329,41 @@ def full_fine_tune_phi4(
         trainer.train()
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
-            print("\nERROR: CUDA out of memory. Try reducing batch size or using gradient accumulation.")
-            print("Recommended settings:")
-            print("1. Reduce batch_size to 1 or 2")
-            print("2. Increase gradient_accumulation_steps to 8 or 16")
-            print("3. Reduce max_length if your sequences allow it")
+            print("\nERROR: CUDA out of memory even with memory optimizations.")
+            print("Try these extreme settings:")
+            print("1. Set max_samples to 10 to first verify the pipeline works")
+            print("2. Decrease max_length to 256")
+            print("3. Use lora_r=4 (smaller adapter)")
         raise
     
-    # Save the fine-tuned model
-    print(f"Saving model to {output_dir}...")
-    trainer.save_model(output_dir)
+    # Save the fine-tuned model (LoRA adapter)
+    print(f"Saving LoRA adapter to {output_dir}...")
+    model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     print("Training complete!")
     
     return model, tokenizer
 
-def test_fine_tuned_model(model_path, test_input):
+
+def test_fine_tuned_model(model_path, base_model_path, test_input):
     """Test the fine-tuned model with a sample input."""
-    print(f"Loading fine-tuned model from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    print(f"Loading fine-tuned LoRA adapter from {model_path}...")
     
-    # Use consistent device mapping to avoid mixed device errors
-    device_map = {"": 0}  # Force all to GPU 0
+    # Load tokenizer from base model
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map=device_map,
+    # First load the base model with 8-bit quantization
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        load_in_8bit=True,
+        torch_dtype=torch.float16,
+        device_map="auto",
         trust_remote_code=True
     )
     
-    # Ensure model is on the default device
-    model = model.to(DEFAULT_DEVICE)
+    # Then load the adapter on top of it
+    from peft import PeftModel
+    model = PeftModel.from_pretrained(base_model, model_path)
     
     # Format special SQL conversion input if needed
     if not test_input.startswith("Convert the following PL/SQL code to C# LINQ:"):
@@ -346,14 +376,13 @@ def test_fine_tuned_model(model_path, test_input):
     
     # Generate a response
     inputs = tokenizer(chat_formatted_input, return_tensors="pt")
-    # Ensure all inputs are on the default device
-    inputs = {k: v.to(DEFAULT_DEVICE) for k, v in inputs.items()}
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
     
     print("Generating response...")
     with torch.no_grad():
         output = model.generate(
             **inputs,
-            max_length=2048,
+            max_length=1024,  # Shorter to save memory
             temperature=0.7,
             top_p=0.95,
             repetition_penalty=1.1,
@@ -368,31 +397,38 @@ def test_fine_tuned_model(model_path, test_input):
     
     return assistant_response
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Full fine-tune the Microsoft Phi-4 model (complete model, not just LoRA)")
+    parser = argparse.ArgumentParser(description="Memory-efficient fine-tuning for Phi-4 using LoRA and quantization")
     parser.add_argument("--model_path", type=str, default="microsoft/Phi-4", 
                         help="Path or name of the pre-trained model")
     parser.add_argument("--dataset_path", type=str, default="phi4_fine_tuning_dataset.json", 
                         help="Path to the input dataset file (JSON or JSONL format)")
-    parser.add_argument("--output_dir", type=str, default="./phi4-full-finetuned", 
-                        help="Directory to save the fine-tuned model")
+    parser.add_argument("--output_dir", type=str, default="./phi4-lora-finetuned", 
+                        help="Directory to save the fine-tuned LoRA adapter")
     parser.add_argument("--num_epochs", type=int, default=3, 
                         help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=1, 
-                        help="Training batch size (default: 1 to avoid OOM errors)")
+                        help="Training batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, 
                         help="Number of updates steps to accumulate before backward pass")
-    parser.add_argument("--learning_rate", type=float, default=2e-5, 
+    parser.add_argument("--learning_rate", type=float, default=2e-4, 
                         help="Learning rate for training")
-    parser.add_argument("--max_length", type=int, default=1024, 
-                        help="Maximum sequence length (default: 1024 to reduce memory usage)")
+    parser.add_argument("--max_length", type=int, default=512, 
+                        help="Maximum sequence length")
     parser.add_argument("--max_samples", type=int, default=None, 
                         help="Maximum number of samples to use from the dataset")
-    parser.add_argument("--save_strategy", type=str, default="epoch", 
+    parser.add_argument("--lora_r", type=int, default=8, 
+                        help="LoRA attention dimension")
+    parser.add_argument("--lora_alpha", type=int, default=16, 
+                        help="LoRA alpha scaling factor")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, 
+                        help="LoRA dropout probability")
+    parser.add_argument("--save_strategy", type=str, default="steps", 
                         choices=["epoch", "steps", "no"],
                         help="When to save model checkpoints")
-    parser.add_argument("--eval_steps", type=int, default=500, 
-                        help="Number of steps between evaluations")
+    parser.add_argument("--save_steps", type=int, default=50, 
+                        help="Steps to save when using steps strategy")
     parser.add_argument("--test", action="store_true",
                         help="Test the fine-tuned model after training")
     parser.add_argument("--test_only", action="store_true",
@@ -400,14 +436,12 @@ if __name__ == "__main__":
     parser.add_argument("--test_input", type=str, 
                         default="SELECT * FROM employees WHERE department_id = 10;",
                         help="Test input for the model")
-    parser.add_argument("--offload_to_cpu", action="store_true", default=True,
-                        help="Offload model layers to CPU to reduce GPU memory usage")
     
     args = parser.parse_args()
     
     # Perform fine-tuning unless test_only is specified
     if not args.test_only:
-        model, tokenizer = full_fine_tune_phi4(
+        model, tokenizer = memory_efficient_fine_tune(
             model_path=args.model_path,
             dataset_path=args.dataset_path,
             output_dir=args.output_dir,
@@ -417,13 +451,20 @@ if __name__ == "__main__":
             learning_rate=args.learning_rate,
             max_length=args.max_length,
             max_samples=args.max_samples,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
             save_strategy=args.save_strategy,
-            eval_steps=args.eval_steps
+            save_steps=args.save_steps
         )
     
     # Test the model if requested
     if args.test or args.test_only:
         print("\nTesting fine-tuned model...")
-        response = test_fine_tuned_model(args.output_dir, args.test_input)
+        response = test_fine_tuned_model(
+            args.output_dir, 
+            args.model_path if not args.test_only else args.model_path,
+            args.test_input
+        )
         print("\nModel response:")
         print(response)
