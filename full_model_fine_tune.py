@@ -19,6 +19,9 @@ from datasets import Dataset
 import argparse
 import numpy as np
 
+# Set environment variable to help with memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+
 def print_system_info():
     """Print system information including GPU, CPU and memory."""
     print("\n=== System Information ===")
@@ -121,14 +124,14 @@ def load_dataset(json_path, max_samples=None):
         'validation': train_val_split['test']
     }
 
-def tokenize_dataset(dataset, tokenizer):
+def tokenize_dataset(dataset, tokenizer, max_length=2048):
     """Tokenize the dataset for training."""
     def tokenize_function(examples):
         results = tokenizer(
             examples["text"],
             padding="max_length",
             truncation=True,
-            max_length=2048,  # Increased max length for longer conversations
+            max_length=max_length,
             return_tensors="pt"
         )
         
@@ -162,10 +165,10 @@ def full_fine_tune_phi4(
     dataset_path: str, 
     output_dir: str, 
     num_epochs: int = 3,
-    batch_size: int = 4,
-    gradient_accumulation_steps: int = 4,
+    batch_size: int = 1,  # Reduced default batch size
+    gradient_accumulation_steps: int = 16,  # Increased gradient accumulation
     learning_rate: float = 2e-5,
-    max_length: int = 2048,
+    max_length: int = 1024,  # Reduced sequence length
     max_samples: int = None,
     save_strategy: str = "epoch",
     eval_steps: int = 500
@@ -189,12 +192,30 @@ def full_fine_tune_phi4(
         tokenizer.pad_token = tokenizer.eos_token
     
     print(f"Loading model from {model_path}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=compute_dtype if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True
-    )
+    
+    # More memory-efficient model loading with low_cpu_mem_usage and offload options
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=compute_dtype,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            offload_folder="offload_folder"
+        )
+    except Exception as e:
+        print(f"Error loading model with device_map='auto': {e}")
+        print("Trying with more conservative device map settings...")
+        
+        # Try loading with a more explicit device map if auto fails
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=compute_dtype,
+            device_map="balanced",
+            max_memory={0: "18GB", "cpu": "32GB"},
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
     
     # Prepare model for training
     model.config.use_cache = False  # Important for training efficiency
@@ -210,7 +231,7 @@ def full_fine_tune_phi4(
     
     # Tokenize the dataset
     print("Tokenizing dataset...")
-    tokenized_dataset = tokenize_dataset(dataset, tokenizer)
+    tokenized_dataset = tokenize_dataset(dataset, tokenizer, max_length=max_length)
     free_memory()
     
     # Prepare data collator
@@ -332,14 +353,14 @@ if __name__ == "__main__":
                         help="Directory to save the fine-tuned model")
     parser.add_argument("--num_epochs", type=int, default=3, 
                         help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=4, 
-                        help="Training batch size")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, 
+    parser.add_argument("--batch_size", type=int, default=1, 
+                        help="Training batch size (default: 1 to avoid OOM errors)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16, 
                         help="Number of updates steps to accumulate before backward pass")
     parser.add_argument("--learning_rate", type=float, default=2e-5, 
                         help="Learning rate for training")
-    parser.add_argument("--max_length", type=int, default=2048, 
-                        help="Maximum sequence length")
+    parser.add_argument("--max_length", type=int, default=1024, 
+                        help="Maximum sequence length (default: 1024 to reduce memory usage)")
     parser.add_argument("--max_samples", type=int, default=None, 
                         help="Maximum number of samples to use from the dataset")
     parser.add_argument("--save_strategy", type=str, default="epoch", 
@@ -354,6 +375,8 @@ if __name__ == "__main__":
     parser.add_argument("--test_input", type=str, 
                         default="SELECT * FROM employees WHERE department_id = 10;",
                         help="Test input for the model")
+    parser.add_argument("--offload_to_cpu", action="store_true", default=True,
+                        help="Offload model layers to CPU to reduce GPU memory usage")
     
     args = parser.parse_args()
     
