@@ -22,6 +22,10 @@ import numpy as np
 # Set environment variable to help with memory fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
+# Force PyTorch to use a specific GPU device 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Only use the first GPU
+DEFAULT_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
 def print_system_info():
     """Print system information including GPU, CPU and memory."""
     print("\n=== System Information ===")
@@ -193,29 +197,38 @@ def full_fine_tune_phi4(
     
     print(f"Loading model from {model_path}...")
     
-    # More memory-efficient model loading with low_cpu_mem_usage and offload options
+    # Use a fixed device map to avoid mixing devices
+    device_map = {"": 0}  # Force all modules to GPU 0
+    
     try:
+        # Load model with explicit device map to ensure all weights are on the same GPU
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=compute_dtype,
-            device_map="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-            offload_folder="offload_folder"
-        )
-    except Exception as e:
-        print(f"Error loading model with device_map='auto': {e}")
-        print("Trying with more conservative device map settings...")
-        
-        # Try loading with a more explicit device map if auto fails
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=compute_dtype,
-            device_map="balanced",
-            max_memory={0: "18GB", "cpu": "32GB"},
+            device_map=device_map,  # Use fixed device map
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
+        # Explicitly move model to default device to ensure consistency
+        model = model.to(DEFAULT_DEVICE)
+    except Exception as e:
+        print(f"Error loading model with fixed device map: {e}")
+        print("Trying CPU offloading as fallback...")
+        
+        # Fall back to CPU offloading if GPU memory is insufficient
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=compute_dtype,
+            device_map="cpu",  # Load to CPU first
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+        # Move parts of the model to GPU as possible
+        try:
+            model = model.to(DEFAULT_DEVICE)
+            print("Successfully moved model to GPU")
+        except Exception as e:
+            print(f"Couldn't move full model to GPU, keeping on CPU: {e}")
     
     # Prepare model for training
     model.config.use_cache = False  # Important for training efficiency
@@ -322,7 +335,7 @@ def test_fine_tuned_model(model_path, test_input):
     # Generate a response
     inputs = tokenizer(chat_formatted_input, return_tensors="pt")
     if torch.cuda.is_available():
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        inputs = {k: v.to(DEFAULT_DEVICE) for k, v in inputs.items()}
     
     print("Generating response...")
     with torch.no_grad():
