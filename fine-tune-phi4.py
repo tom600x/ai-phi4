@@ -98,6 +98,7 @@ def print_system_info():
 def validate_jsonl_dataset(dataset_path: str) -> bool:
     """
     Validate that the dataset file exists and has the expected format for Phi-4 fine-tuning.
+    Supports both JSONL and JSON array formats.
     
     Args:
         dataset_path: Path to the dataset file
@@ -114,47 +115,108 @@ def validate_jsonl_dataset(dataset_path: str) -> bool:
         if os.path.getsize(dataset_path) == 0:
             print(f"Error: Dataset file {dataset_path} is empty.")
             return False
-            
-        # For JSONL files - check line by line
+        
         with open(dataset_path, 'r', encoding='utf-8') as f:
-            line_count = 0
-            for i, line in enumerate(f):
-                line_count += 1
+            first_char = f.read(1)
+            f.seek(0)  # Reset file pointer to beginning
+            
+            # Check if the file starts with '[' indicating a JSON array
+            if first_char == '[':
+                # Process as JSON array
                 try:
-                    # Parse each line as JSON
-                    data = json.loads(line)
-                    
-                    # Validate expected Phi-4 format with messages array containing role and content
-                    if 'messages' not in data:
-                        print(f"Error: Line {i+1} is missing 'messages' field.")
+                    data = json.load(f)
+                    if not isinstance(data, list):
+                        print("Error: File is not a JSON array.")
                         return False
                     
-                    messages = data['messages']
-                    if not isinstance(messages, list) or len(messages) < 2:
-                        print(f"Error: Line {i+1} should have at least 2 messages in the conversation.")
-                        return False
+                    example_count = len(data)
+                    valid_examples = 0
                     
-                    # Check that we have the right structure in each message
-                    for msg in messages:
-                        if not all(key in msg for key in ['role', 'content']):
-                            print(f"Error: Line {i+1} has message missing 'role' or 'content'.")
-                            return False
+                    for i, example in enumerate(data):
+                        # Validate expected Phi-4 format with messages array
+                        if 'messages' not in example:
+                            print(f"Error: Item {i} is missing 'messages' field.")
+                            continue
                         
-                        if msg['role'] not in ['user', 'assistant', 'system']:
-                            print(f"Error: Line {i+1} has invalid role: {msg['role']}")
-                            return False
+                        messages = example['messages']
+                        if not isinstance(messages, list) or len(messages) < 2:
+                            print(f"Error: Item {i} should have at least 2 messages in the conversation.")
+                            continue
+                        
+                        # Check that we have the right structure in each message
+                        valid_messages = True
+                        for msg in messages:
+                            if not all(key in msg for key in ['role', 'content']):
+                                print(f"Error: Item {i} has message missing 'role' or 'content'.")
+                                valid_messages = False
+                                break
+                            
+                            if msg['role'] not in ['user', 'assistant', 'system']:
+                                print(f"Error: Item {i} has invalid role: {msg['role']}")
+                                valid_messages = False
+                                break
+                        
+                        # Check if conversation alternates between user and assistant
+                        for j in range(len(messages) - 1):
+                            if messages[j]['role'] == messages[j+1]['role']:
+                                print(f"Warning: Item {i} has consecutive messages with the same role.")
+                        
+                        if valid_messages:
+                            valid_examples += 1
                     
-                    # Check if conversation alternates between user and assistant
-                    for j in range(len(messages) - 1):
-                        if messages[j]['role'] == messages[j+1]['role']:
-                            print(f"Warning: Line {i+1} has consecutive messages with the same role.")
+                    print(f"Successfully validated {valid_examples}/{example_count} conversation examples in JSON array.")
+                    return valid_examples > 0
                 
                 except json.JSONDecodeError:
-                    print(f"Error: Line {i+1} is not valid JSON.")
+                    print(f"Error: File is not valid JSON.")
                     return False
+            else:
+                # Process as JSONL (line by line)
+                line_count = 0
+                valid_count = 0
+                for i, line in enumerate(f):
+                    line_count += 1
+                    try:
+                        # Parse each line as JSON
+                        data = json.loads(line)
+                        
+                        # Validate expected Phi-4 format with messages array
+                        if 'messages' not in data:
+                            print(f"Error: Line {i+1} is missing 'messages' field.")
+                            continue
+                        
+                        messages = data['messages']
+                        if not isinstance(messages, list) or len(messages) < 2:
+                            print(f"Error: Line {i+1} should have at least 2 messages in the conversation.")
+                            continue
+                        
+                        # Check that we have the right structure in each message
+                        valid_messages = True
+                        for msg in messages:
+                            if not all(key in msg for key in ['role', 'content']):
+                                print(f"Error: Line {i+1} has message missing 'role' or 'content'.")
+                                valid_messages = False
+                                break
+                            
+                            if msg['role'] not in ['user', 'assistant', 'system']:
+                                print(f"Error: Line {i+1} has invalid role: {msg['role']}")
+                                valid_messages = False
+                                break
+                        
+                        if valid_messages:
+                            valid_count += 1
+                        
+                        # Check if conversation alternates between user and assistant
+                        for j in range(len(messages) - 1):
+                            if messages[j]['role'] == messages[j+1]['role']:
+                                print(f"Warning: Line {i+1} has consecutive messages with the same role.")
+                    
+                    except json.JSONDecodeError:
+                        print(f"Error: Line {i+1} is not valid JSON.")
+                        continue
                 
-            print(f"Successfully validated {line_count} conversation examples.")
-            return True
+                print(f"Successfully validated {valid_count}/{line_count} conversation examples in JSONL format.")
+                return valid_count > 0
             
     except Exception as e:
         print(f"Error validating dataset: {str(e)}")
@@ -163,25 +225,39 @@ def validate_jsonl_dataset(dataset_path: str) -> bool:
 def load_phi4_dataset(dataset_path: str, max_samples=None):
     """
     Load and prepare the dataset for Phi-4 fine-tuning with multi-CPU optimization.
+    Supports both JSONL and JSON array formats.
     """
     print(f"Loading dataset from {dataset_path}...")
     
-    # Load the dataset as JSONL
+    # Load the dataset
     raw_dataset = []
     
     with open(dataset_path, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
-            if max_samples is not None and i >= max_samples:
-                break
-            example = json.loads(line)
-            raw_dataset.append(example)
+        first_char = f.read(1)
+        f.seek(0)  # Reset file pointer to beginning
+        
+        # Check if the file starts with '[' indicating a JSON array
+        if first_char == '[':
+            # Process as JSON array
+            print("Detected JSON array format")
+            data = json.load(f)
+            if max_samples is not None:
+                data = data[:max_samples]
+            raw_dataset = data
+        else:
+            # Process as JSONL (line by line)
+            print("Detected JSONL format")
+            for i, line in enumerate(f):
+                if max_samples is not None and i >= max_samples:
+                    break
+                example = json.loads(line)
+                raw_dataset.append(example)
     
     # Process the raw dataset into the format needed for fine-tuning
     processed_data = []
     
-    # Special tokens for Phi-4 conversations
+    # Format conversations according to the Phi-4 format
     for example in raw_dataset:
-        # Format conversation according to the Phi-4 format
         formatted_text = ""
         for msg in example["messages"]:
             role = msg["role"]
