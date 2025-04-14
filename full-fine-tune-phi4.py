@@ -89,7 +89,7 @@ def tokenize_dataset(dataset, tokenizer):
     
     return tokenized_dataset
 
-def full_fine_tune_phi4(input_json_path, output_model_dir, num_epochs=3, batch_size=4, learning_rate=2e-5):
+def full_fine_tune_phi4(input_json_path, output_model_dir, model_path=None, num_epochs=3, batch_size=4, learning_rate=2e-5):
     """Perform full fine-tuning on the Phi-4 model."""
     # Load the dataset
     print(f"Loading dataset from {input_json_path}...")
@@ -100,18 +100,23 @@ def full_fine_tune_phi4(input_json_path, output_model_dir, num_epochs=3, batch_s
     dataset = dataset.train_test_split(test_size=0.1, seed=42)
     
     # Load the pre-trained Phi-4 model and tokenizer
-    model_name = "/home/TomAdmin/phi-4"
+    if model_path is None:
+        # Default paths for different operating systems
+        if os.name == 'nt':  # Windows
+            model_path = "microsoft/Phi-4"  # Use HuggingFace model on Windows
+        else:
+            model_path = "/home/TomAdmin/phi-4"  # Linux path
     
-    print(f"Loading tokenizer from {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    print(f"Loading tokenizer from {model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     
     # Ensure we have proper padding and EOS tokens
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    print(f"Loading model from {model_name}...")
+    print(f"Loading model from {model_path}...")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        model_path,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True
@@ -183,11 +188,18 @@ def test_fine_tuned_model(model_path, test_input):
         trust_remote_code=True
     )
     
-    # Format the test input for the model
-    formatted_input = f"<|user|>\n{test_input}\n<|assistant|>\n"
+    # Check if test_input is already properly formatted
+    if not test_input.startswith("Convert the following PL/SQL code to C# LINQ:"):
+        # Format as a SQL conversion query similar to the dataset format
+        formatted_input = f"Convert the following PL/SQL code to C# LINQ: \n\n```sql\n{test_input}\n```\n"
+    else:
+        formatted_input = test_input
+    
+    # Format with chat markers
+    chat_formatted_input = f"<|user|>\n{formatted_input}\n<|assistant|>\n"
     
     # Generate a response
-    inputs = tokenizer(formatted_input, return_tensors="pt")
+    inputs = tokenizer(chat_formatted_input, return_tensors="pt")
     if torch.cuda.is_available():
         inputs = {k: v.to("cuda") for k, v in inputs.items()}
     
@@ -197,8 +209,8 @@ def test_fine_tuned_model(model_path, test_input):
             **inputs,
             max_length=2048,
             temperature=0.7,
-            top_p=0.9,
-            repetition_penalty=1.2,
+            top_p=0.95,
+            repetition_penalty=1.1,
             do_sample=True
         )
     
@@ -218,6 +230,8 @@ if __name__ == "__main__":
                         help="Path to the input JSON dataset.")
     parser.add_argument("--output_model_dir", type=str, default="./phi4-finetuned", 
                         help="Directory to save the fine-tuned model.")
+    parser.add_argument("--model_path", type=str, default=None, 
+                        help="Path to the pre-trained Phi-4 model.")
     parser.add_argument("--num_epochs", type=int, default=3, 
                         help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=4, 
@@ -229,18 +243,22 @@ if __name__ == "__main__":
     parser.add_argument("--test_input", type=str, 
                         default="Convert the following PL/SQL code to C# LINQ: \n\nSELECT * FROM employees WHERE department_id = 10;",
                         help="Test input for the fine-tuned model.")
+    parser.add_argument("--test_only", action="store_true",
+                        help="Only test the model without fine-tuning.")
     
     args = parser.parse_args()
     
-    full_fine_tune_phi4(
-        input_json_path=args.input_json,
-        output_model_dir=args.output_model_dir,
-        num_epochs=args.num_epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate
-    )
+    if not args.test_only:
+        full_fine_tune_phi4(
+            input_json_path=args.input_json,
+            output_model_dir=args.output_model_dir,
+            model_path=args.model_path,
+            num_epochs=args.num_epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate
+        )
     
-    if args.test:
+    if args.test or args.test_only:
         print("\nTesting fine-tuned model...")
         response = test_fine_tuned_model(args.output_model_dir, args.test_input)
         print("\nModel response:")
