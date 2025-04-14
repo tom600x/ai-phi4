@@ -35,7 +35,7 @@ print("Loading model and tokenizer, please wait...")
 model = AutoModelForCausalLM.from_pretrained(
     "/home/TomAdmin/output-model/phi-3-tuned",
     low_cpu_mem_usage=True,
-    torch_dtype=torch.bfloat16,  # bfloat16 can be faster on CPUs with AVX512 support
+    torch_dtype=torch.float32,  # Changed from bfloat16 to float32 for CPU compatibility
     device_map="cpu",
 )
 
