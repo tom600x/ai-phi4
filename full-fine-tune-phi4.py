@@ -12,24 +12,24 @@ def load_dataset(json_path):
     """Load and process conversation dataset from JSON file."""
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
-            # Try first as JSONL format (each line is a JSON object)
-            data = []
-            for line in f:
-                if line.strip():
-                    try:
-                        data.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-            
-            # If no valid data was loaded, try as a regular JSON array or object
-            if not data:
+            # First try as a regular JSON array or object
+            try:
+                data = json.load(f)
+                # If it's not a list, make it a list
+                if not isinstance(data, list):
+                    data = [data]
+            except json.JSONDecodeError:
+                # If regular JSON fails, try as JSONL format (each line is a JSON object)
                 f.seek(0)
-                try:
-                    data = json.load(f)
-                    # If it's not a list, make it a list
-                    if not isinstance(data, list):
-                        data = [data]
-                except json.JSONDecodeError:
+                data = []
+                for line in f:
+                    if line.strip():
+                        try:
+                            data.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+                
+                if not data:
                     raise ValueError(f"Could not parse {json_path} as JSON or JSONL")
     except Exception as e:
         print(f"Error loading dataset: {e}")
@@ -51,6 +51,10 @@ def load_dataset(json_path):
                 elif role == "assistant":
                     conversation += f"<|assistant|>\n{content}\n"
             
+            formatted_data.append({"text": conversation})
+        # Handle legacy format with input/output fields
+        elif "input" in item and "output" in item:
+            conversation = f"<|user|>\n{item['input']}\n<|assistant|>\n{item['output']}\n"
             formatted_data.append({"text": conversation})
     
     print(f"Processed {len(formatted_data)} conversations from the dataset")

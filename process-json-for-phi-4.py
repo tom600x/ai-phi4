@@ -47,11 +47,10 @@ try:
             
             fine_tuning_data.append(conversation)
 
-    # Save the preprocessed dataset in the format expected by Phi-4
+    # Save the preprocessed dataset as a single JSON array (not JSONL)
     with open("phi4_fine_tuning_dataset.json", "w") as f:
-        # Write each conversation as a separate line (JSONL format)
-        for conversation in fine_tuning_data:
-            f.write(json.dumps(conversation) + "\n")
+        # Write the entire dataset as a single JSON array
+        json.dump(fine_tuning_data, f, indent=2)
 
     print(f"Dataset preprocessed and saved to 'phi4_fine_tuning_dataset.json' with {len(fine_tuning_data)} items.")
     print("Format is compatible with Phi-4 fine-tuning requirements.")

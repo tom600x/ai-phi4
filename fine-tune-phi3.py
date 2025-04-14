@@ -39,12 +39,16 @@ def validate_dataset(dataset_path):
                 if all(isinstance(item, dict) and 'input' in item and 'output' in item for item in data):
                     print("Found dataset with input/output pairs format.")
                     return True
+                # Check for messages field (typical for chat format like in phi4 dataset)
+                elif all(isinstance(item, dict) and 'messages' in item for item in data):
+                    print("Found dataset with messages format (chat-style).")
+                    return True
                 # Check for text field (typical for general language model datasets)
                 elif all(isinstance(item, dict) and 'text' in item for item in data):
                     print("Found dataset with text field format.")
                     return True
                 else:
-                    print(f"Error: Dataset must contain records with either 'text' or 'input'/'output' fields.")
+                    print(f"Error: Dataset must contain records with either 'text', 'input'/'output', or 'messages' fields.")
                     print(f"Found structure: {list(data[0].keys()) if data else 'empty list'}")
                     return False
             elif isinstance(data, dict):
@@ -59,10 +63,10 @@ def validate_dataset(dataset_path):
                 train_records = data['train']
                 if isinstance(train_records, list) and train_records:
                     first_record = train_records[0]
-                    if isinstance(first_record, dict) and ('input' in first_record and 'output' in first_record) or 'text' in first_record:
+                    if isinstance(first_record, dict) and ('input' in first_record and 'output' in first_record) or 'text' in first_record or 'messages' in first_record:
                         return True
                 
-                print(f"Error: Dataset's train records must contain either 'text' or 'input'/'output' fields.")
+                print(f"Error: Dataset's train records must contain either 'text', 'input'/'output', or 'messages' fields.")
                 return False
         
         return True
@@ -178,12 +182,29 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=1
                 print(f"Processing {split} chunk {i}-{end_idx} of {total_samples}")
                 chunk = dataset[split].select(range(i, end_idx))
                 
-                # Process this chunk
-                if 'text' not in chunk[0] and 'input' in chunk[0] and 'output' in chunk[0]:
-                    chunk = chunk.map(
-                        lambda example: {'text': f"<|user|>\n{example['input']}\n<|assistant|>\n{example['output']}\n"},
-                        remove_columns=['input', 'output']
-                    )
+                # Process this chunk based on its format
+                if 'text' not in chunk.column_names:
+                    if 'input' in chunk.column_names and 'output' in chunk.column_names:
+                        # Process standard input/output format
+                        chunk = chunk.map(
+                            lambda example: {'text': f"<|user|>\n{example['input']}\n<|assistant|>\n{example['output']}\n"},
+                            remove_columns=['input', 'output']
+                        )
+                    elif 'messages' in chunk.column_names:
+                        # Process chat format with messages (phi4 dataset)
+                        def format_chat_messages(example):
+                            formatted_text = ""
+                            for msg in example['messages']:
+                                if msg['role'] == 'user':
+                                    formatted_text += f"<|user|>\n{msg['content']}\n"
+                                elif msg['role'] == 'assistant':
+                                    formatted_text += f"<|assistant|>\n{msg['content']}\n"
+                            return {'text': formatted_text}
+                        
+                        chunk = chunk.map(
+                            format_chat_messages,
+                            remove_columns=['messages']
+                        )
                 
                 # Tokenize the chunk
                 tokenized_chunk = chunk.map(
@@ -275,7 +296,7 @@ def fine_tune_model(model_path, dataset_path, output_dir, epochs=3, batch_size=1
 if __name__ == "__main__":
     fine_tune_model(
         model_path="/home/TomAdmin/phi-3-mini-128k-instruct",  # Local model path
-        dataset_path="/home/TomAdmin/ai-phi4/fine_tuning_dataset.json",
+        dataset_path="/home/TomAdmin/ai-phi4/phi4_fine_tuning_dataset.json",  # Updated to use phi4 dataset
         output_dir="/home/TomAdmin/output-model/phi-3-tuned",
         epochs=3,
         batch_size=1,
