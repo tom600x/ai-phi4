@@ -316,12 +316,19 @@ def test_fine_tuned_model(model_path, test_input):
     """Test the fine-tuned model with a sample input."""
     print(f"Loading fine-tuned model from {model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    # Use consistent device mapping to avoid mixed device errors
+    device_map = {"": 0}  # Force all to GPU 0
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
+        device_map=device_map,
         trust_remote_code=True
     )
+    
+    # Ensure model is on the default device
+    model = model.to(DEFAULT_DEVICE)
     
     # Format special SQL conversion input if needed
     if not test_input.startswith("Convert the following PL/SQL code to C# LINQ:"):
@@ -334,8 +341,8 @@ def test_fine_tuned_model(model_path, test_input):
     
     # Generate a response
     inputs = tokenizer(chat_formatted_input, return_tensors="pt")
-    if torch.cuda.is_available():
-        inputs = {k: v.to(DEFAULT_DEVICE) for k, v in inputs.items()}
+    # Ensure all inputs are on the default device
+    inputs = {k: v.to(DEFAULT_DEVICE) for k, v in inputs.items()}
     
     print("Generating response...")
     with torch.no_grad():
