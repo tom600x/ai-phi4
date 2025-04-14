@@ -168,7 +168,7 @@ def full_fine_tune_phi4(
     max_length: int = 2048,
     max_samples: int = None,
     save_strategy: str = "epoch",
-    evaluation_strategy: str = "epoch"
+    eval_steps: int = 500
 ):
     """
     Perform full fine-tuning on the Phi-4 model with the entire model's parameters.
@@ -220,6 +220,7 @@ def full_fine_tune_phi4(
     )
     
     # Define training arguments with optimized settings for Phi-4
+    # Note: Removed evaluation_strategy parameter which is causing the error
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
@@ -230,7 +231,6 @@ def full_fine_tune_phi4(
         weight_decay=0.01,
         logging_dir=os.path.join(output_dir, 'logs'),
         logging_steps=10,
-        evaluation_strategy=evaluation_strategy,
         save_strategy=save_strategy,
         save_total_limit=2,
         fp16=torch.cuda.is_available() and compute_dtype == torch.float16,
@@ -240,9 +240,11 @@ def full_fine_tune_phi4(
         gradient_checkpointing=True,  # To help with memory usage
         optim="adamw_torch",
         lr_scheduler_type="cosine",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        # Use these if your transformers version supports them:
+        # eval_steps=eval_steps,
+        # load_best_model_at_end=True, 
+        # metric_for_best_model="loss",
+        # greater_is_better=False,
     )
     
     # Initialize the Trainer
@@ -343,9 +345,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_strategy", type=str, default="epoch", 
                         choices=["epoch", "steps", "no"],
                         help="When to save model checkpoints")
-    parser.add_argument("--evaluation_strategy", type=str, default="epoch", 
-                        choices=["epoch", "steps", "no"],
-                        help="When to run evaluation")
+    parser.add_argument("--eval_steps", type=int, default=500, 
+                        help="Number of steps between evaluations")
     parser.add_argument("--test", action="store_true",
                         help="Test the fine-tuned model after training")
     parser.add_argument("--test_only", action="store_true",
@@ -369,7 +370,7 @@ if __name__ == "__main__":
             max_length=args.max_length,
             max_samples=args.max_samples,
             save_strategy=args.save_strategy,
-            evaluation_strategy=args.evaluation_strategy
+            eval_steps=args.eval_steps
         )
     
     # Test the model if requested
